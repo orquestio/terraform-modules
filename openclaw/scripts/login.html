@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orquestio — Iniciar sesión</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #050505; color: #e4e4e7; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .card { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 16px; padding: 48px 40px 40px; width: 100%; max-width: 420px; }
+  .brand { text-align: center; margin-bottom: 36px; }
+  .brand .mark { display: inline-flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .brand .mark svg { width: 36px; height: 36px; }
+  .brand h1 { font-size: 24px; font-weight: 700; color: #fff; letter-spacing: -0.5px; }
+  .brand .tagline { font-size: 13px; color: #525252; margin-top: 6px; }
+  .product { display: flex; align-items: center; gap: 10px; background: #0f0f0f; border: 1px solid #1a1a1a; border-radius: 10px; padding: 12px 16px; margin-bottom: 28px; }
+  .product .emoji { font-size: 26px; }
+  .product .info { flex: 1; }
+  .product .info .name { font-size: 14px; font-weight: 600; color: #e4e4e7; }
+  .product .info .desc { font-size: 12px; color: #525252; }
+  .product .badge { background: rgba(62,207,142,0.1); color: #3ecf8e; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px; }
+  .field { margin-bottom: 20px; }
+  .field label { display: block; font-size: 13px; font-weight: 500; color: #888; margin-bottom: 6px; }
+  .field input { width: 100%; padding: 12px 16px; background: #0f0f0f; border: 1px solid #2a2a2a; border-radius: 8px; color: #fff; font-size: 15px; outline: none; transition: border-color 0.2s; }
+  .field input:focus { border-color: #3ecf8e; }
+  .field input::placeholder { color: #333; }
+  .btn { width: 100%; padding: 12px; background: #3ecf8e; color: #050505; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; margin-top: 4px; }
+  .btn:hover { background: #34b87a; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .error { display: none; background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); color: #f87171; padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; text-align: center; }
+  .footer { text-align: center; margin-top: 32px; font-size: 12px; color: #333; }
+  .footer a { color: #3ecf8e; text-decoration: none; }
+  .footer a:hover { text-decoration: underline; }
+  @media (max-width: 480px) { .card { margin: 16px; padding: 36px 24px 32px; } }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">
+    <div class="mark">
+      <svg viewBox="0 0 48 48" fill="none"><path d="M24 2L46 24L24 46L2 24Z" stroke="#3ecf8e" stroke-width="2.5" stroke-linejoin="round" fill="none"/><circle cx="24" cy="24" r="7" fill="#3ecf8e"/></svg>
+      <h1>Orquestio</h1>
+    </div>
+    <div class="tagline">Agentes autónomos de IA para tu empresa</div>
+  </div>
+  <div class="product">
+    <div class="emoji">🦞</div>
+    <div class="info">
+      <div class="name">OpenClaw</div>
+      <div class="desc">Tu asistente de IA personal</div>
+    </div>
+    <div class="badge">Activo</div>
+  </div>
+  <div class="error" id="error">Contraseña incorrecta</div>
+  <form id="form">
+    <div class="field">
+      <label>Contraseña de acceso</label>
+      <input type="password" id="password" placeholder="Ingresa tu contraseña" autofocus required>
+    </div>
+    <button type="submit" class="btn" id="btn">Iniciar sesión</button>
+  </form>
+</div>
+<div class="footer">
+  Potenciado por <a href="https://orquestio.com" target="_blank">Orquestio</a>
+</div>
+<script>
+async function sha256(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+document.getElementById('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('btn');
+  const err = document.getElementById('error');
+  const pwd = document.getElementById('password').value;
+  btn.disabled = true;
+  btn.textContent = 'Verificando...';
+  err.style.display = 'none';
+  const hash = await sha256(pwd);
+  document.cookie = 'oc_session=' + hash + ';path=/;max-age=604800;SameSite=Lax';
+  try {
+    const res = await fetch('/healthz');
+    if (res.ok) {
+      window.location.href = '/';
+    } else {
+      err.style.display = 'block';
+      document.cookie = 'oc_session=;path=/;max-age=0';
+    }
+  } catch {
+    err.style.display = 'block';
+    document.cookie = 'oc_session=;path=/;max-age=0';
+  }
+  btn.disabled = false;
+  btn.textContent = 'Iniciar sesión';
+});
+</script>
+</body>
+</html>
