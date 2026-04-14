@@ -156,6 +156,12 @@ resource "cloudflare_record" "instance_direct" {
 resource "aws_backup_vault" "instance" {
   name = "${var.project}-${var.instance_id}-vault"
 
+  # Recovery points accumulate over time; without force_destroy, terraform
+  # destroy aborts with InvalidRequestException when the vault is non-empty
+  # and the EC2/EFS/etc end up half-cleaned. force_destroy=true tells the
+  # AWS provider to delete every recovery point before the vault itself.
+  force_destroy = true
+
   tags = {
     Project    = var.project
     InstanceId = var.instance_id
