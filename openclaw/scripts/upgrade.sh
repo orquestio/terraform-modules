@@ -111,10 +111,22 @@ fi
 # Replicate the runtime config of openclaw-current. We reuse the same env vars,
 # volumes, restart policy and command. Only the host port and the container
 # name change.
+#
+# --env-file "$CONTAINER_ENV_FILE": runtime env vars set by update_env_var.sh.
+# Must match the flag used in user_data.sh and restart.sh. user_data.sh creates
+# the file on first boot; we `touch` it here defensively in case that step was
+# ever skipped (legacy instances, repaired bootstrap).
+CONTAINER_ENV_FILE="$EFS_MOUNT/config/container.env"
+if [ ! -f "$CONTAINER_ENV_FILE" ]; then
+  touch "$CONTAINER_ENV_FILE"
+  chmod 600 "$CONTAINER_ENV_FILE"
+fi
+
 log "starting '$NEW_NAME' on host port ${NEW_HOST_PORT}"
 docker run -d \
   --name "$NEW_NAME" \
   --restart unless-stopped \
+  --env-file "$CONTAINER_ENV_FILE" \
   -e HOME=/home/node \
   -e TERM=xterm-256color \
   -e TZ=UTC \

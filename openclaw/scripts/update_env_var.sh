@@ -15,6 +15,12 @@
 # Strategy: write to a single env file on EFS that the container reads on
 # startup, then go through restart.sh so the container picks up the new value.
 # Existing values for the same name are replaced; other vars are preserved.
+#
+# IMPORTANT: this script depends on restart.sh doing a FULL CONTAINER RECREATE
+# (docker stop + docker rm + docker run). A plain `docker restart` does NOT
+# re-read --env-file, so the new value would never reach the process. If
+# restart.sh is ever simplified back to `docker restart`, this script silently
+# becomes a no-op from the container's point of view.
 # =============================================================================
 set -euo pipefail
 

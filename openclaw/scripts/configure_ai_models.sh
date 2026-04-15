@@ -35,50 +35,68 @@ echo "[$(date)] Providers: $(echo "$PROVIDERS_JSON" | python3 -c "import sys,jso
 export CONFIG_FILE PROVIDERS_JSON
 python3 << 'PYEOF'
 import json
-import sys
 import os
 import shutil
 
 config_file = os.environ.get("CONFIG_FILE", "/mnt/efs/config/openclaw.json")
 providers_json = os.environ.get("PROVIDERS_JSON", "[]")
 
-# Read current config
 with open(config_file, "r") as f:
     config = json.load(f)
 
-# Parse providers
-providers = json.loads(providers_json)
+providers_in = json.loads(providers_json)
 
-# Build the models config for OpenClaw
-# OpenClaw expects models in the "models" key as a list of model configs
-models = []
-for p in providers:
-    model_entry = {
-        "provider": p.get("provider", ""),
-        "baseUrl": p.get("baseUrl", ""),
-        "apiKey": p.get("apiKey", ""),
-        "adapter": p.get("adapter", "openai-completions"),
-    }
-    if p.get("model"):
-        model_entry["model"] = p["model"]
+# OpenClaw schema (v2026.4.10): models is an object with "mode" and "providers"
+# map keyed by provider id. Each provider has baseUrl, apiKey, adapter and a
+# "models" array of {id, name, api, reasoning?} entries.
+models_root = config.get("models") or {}
+if not isinstance(models_root, dict):
+    models_root = {}
+models_root["mode"] = "replace"
+providers_map = {}
+models_root["providers"] = providers_map
+
+default_provider_id = None
+default_model_id = None
+
+for p in providers_in:
+    pid = p.get("provider", "").strip()
+    if not pid:
+        continue
+    model_id = p.get("model") or pid
+    model_entry = {"id": model_id, "name": model_id}
+    api = p.get("adapter")
+    if api:
+        model_entry["api"] = api
     if p.get("reasoning"):
         model_entry["reasoning"] = True
-    if p.get("default"):
-        model_entry["default"] = True
-    models.append(model_entry)
 
-# Merge into config
-config["models"] = models
+    prov_entry = {
+        "baseUrl": p.get("baseUrl", ""),
+        "models": [model_entry],
+    }
+    if p.get("apiKey"):
+        prov_entry["apiKey"] = p["apiKey"]
 
-# Backup and write
+    providers_map[pid] = prov_entry
+    if p.get("default") and default_provider_id is None:
+        default_provider_id = pid
+        default_model_id = model_id
+
+config["models"] = models_root
+
+if default_provider_id and default_model_id:
+    agents = config.setdefault("agents", {})
+    defaults = agents.setdefault("defaults", {})
+    defaults["model"] = f"{default_provider_id}/{default_model_id}"
+
 shutil.copy2(config_file, config_file + ".bak")
 with open(config_file, "w") as f:
     json.dump(config, f, indent=2)
 
-# Fix ownership
 os.chown(config_file, 1000, 1000)
 
-print(f"Configured {len(models)} AI provider(s)")
+print(f"Configured {len(providers_in)} AI provider(s)")
 PYEOF
 
 echo "[$(date)] Restarting OpenClaw container to apply config..."

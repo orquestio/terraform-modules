@@ -83,10 +83,25 @@ fi
 # Container name is "openclaw-current" so that upgrade.sh (Fase 4 Sprint 2.2)
 # can reliably address it. Host port is 18789 initially; upgrade.sh will
 # alternate between 18789 and 18790 across subsequent upgrades.
+#
+# --env-file /mnt/efs/config/container.env: runtime env vars set by
+# update_env_var.sh. The file MUST exist before `docker run` or Docker errors
+# out with "no such file" — we `touch` it here with 0600 perms so first boot
+# succeeds with an empty env file, and subsequent calls to update_env_var.sh
+# populate it. A plain `docker restart` does NOT re-read --env-file, which is
+# why restart.sh does a full recreate (docker rm + docker run).
+CONTAINER_ENV_FILE="$EFS_MOUNT/config/container.env"
+if [ ! -f "$CONTAINER_ENV_FILE" ]; then
+  touch "$CONTAINER_ENV_FILE"
+  chmod 600 "$CONTAINER_ENV_FILE"
+  chown 1000:1000 "$CONTAINER_ENV_FILE"
+fi
+
 echo "[$(date)] Starting OpenClaw container"
 docker run -d \
   --name openclaw-current \
   --restart unless-stopped \
+  --env-file "$CONTAINER_ENV_FILE" \
   -e HOME=/home/node \
   -e TERM=xterm-256color \
   -e TZ=UTC \
