@@ -1,28 +1,9 @@
 #!/bin/bash
-# =============================================================================
-# restart.sh — Restart the running OpenClaw container via full RECREATE
-#
-# Contract:
-#   restart.sh
-#   exit 0  → container recreated and healthz passing
-#   exit !=0 → failure (no container, recreate failed, health check timeout)
-#
-# Invoked by the Orquestio orchestrator via AWS SSM send_command as root.
-# stdout/stderr go to the SSM command invocation output.
-#
-# Strategy: full `docker stop` + `docker rm` + `docker run`. A plain
-# `docker restart` does NOT re-read --env-file, so env vars written to
-# /mnt/efs/config/container.env by update_env_var.sh would never become
-# visible to the process inside the container. Recreate is the only way to
-# re-read the env-file with the Docker CLI.
-#
-# Image and host port are preserved from the currently-running container
-# (detected via `docker inspect`), so a restart never silently changes
-# which OpenClaw version is live — only upgrade.sh ever changes the image.
-# There is no rolling-replacement here; the ~5-10s downtime between stop
-# and the new container passing healthz is the accepted window for an
-# explicit operator-triggered restart.
-# =============================================================================
+# restart.sh — full container RECREATE (stop + rm + run). Plain
+# `docker restart` does NOT re-read --env-file, so env vars set by
+# update_env_var.sh would never reach the container. Image and host port
+# are preserved via docker inspect (only upgrade.sh changes them).
+# Invoked by the orchestrator via SSM send_command; stdout/stderr → SSM.
 set -euo pipefail
 
 CURRENT_NAME="openclaw-current"
@@ -49,8 +30,7 @@ if ! docker inspect "$CURRENT_NAME" >/dev/null 2>&1; then
   exit 3
 fi
 
-# Find the host port the container exposes so we can preserve it on recreate
-# and health-check against it afterwards.
+# Preserve the current host port on recreate (upgrade.sh alternates, we don't).
 HOST_PORT=$(docker inspect --format \
   "{{(index (index .NetworkSettings.Ports \"${CONTAINER_PORT}/tcp\") 0).HostPort}}" \
   "$CURRENT_NAME" 2>/dev/null || echo "")
@@ -72,17 +52,12 @@ if [ -z "$CURRENT_IMAGE" ]; then
 fi
 log "current image: ${CURRENT_IMAGE}"
 
-# Defensive touch: user_data.sh is supposed to create this file at first boot,
-# but legacy instances bootstrapped before this fix may not have it. Without
-# the file, `docker run --env-file` errors out.
+# Defensive touch for legacy instances bootstrapped before the --env-file fix.
 if [ ! -f "$CONTAINER_ENV_FILE" ]; then
-  log "creating missing $CONTAINER_ENV_FILE (legacy instance)"
   touch "$CONTAINER_ENV_FILE"
   chmod 600 "$CONTAINER_ENV_FILE"
 fi
 
-# Stop + remove + run. `docker rm -f` would do stop+rm in one call, but we
-# separate them so a failure at either stage produces a clear error message.
 log "stopping '$CURRENT_NAME'"
 if ! docker stop "$CURRENT_NAME" >/dev/null; then
   err "docker stop failed; container still running, aborting without recreate"
@@ -95,9 +70,7 @@ if ! docker rm "$CURRENT_NAME" >/dev/null; then
   exit 5
 fi
 
-# Recreate. Keep every flag byte-identical to user_data.sh / upgrade.sh step 2
-# except that we preserve the current host port (no alternation — only
-# upgrade.sh alternates).
+# Recreate. Flags kept in sync with user_data.sh / upgrade.sh step 2.
 log "recreating '$CURRENT_NAME' on host port ${HOST_PORT} with image ${CURRENT_IMAGE}"
 if ! docker run -d \
     --name "$CURRENT_NAME" \
@@ -112,13 +85,11 @@ if ! docker run -d \
     "$CURRENT_IMAGE" \
     node openclaw.mjs gateway --bind lan --port "${CONTAINER_PORT}" \
     >/dev/null; then
-  err "docker run failed — container is now MISSING on this host"
-  err "image=${CURRENT_IMAGE} host_port=${HOST_PORT}"
-  err "manual intervention required: re-run user_data.sh or restart the EC2"
+  err "docker run failed — container is MISSING on this host"
+  err "image=${CURRENT_IMAGE} host_port=${HOST_PORT} — manual intervention required"
   exit 5
 fi
 
-# Wait for healthz with exponential backoff. Same loop shape as upgrade.sh.
 log "health-checking at http://127.0.0.1:${HOST_PORT}/healthz (timeout ${HEALTH_TIMEOUT_SECONDS}s)"
 deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECONDS ))
 delay=1

@@ -108,14 +108,9 @@ if docker inspect "$NEW_NAME" >/dev/null 2>&1; then
 fi
 
 # ---------- step 2: start new container on the lateral port ----------
-# Replicate the runtime config of openclaw-current. We reuse the same env vars,
-# volumes, restart policy and command. Only the host port and the container
-# name change.
-#
-# --env-file "$CONTAINER_ENV_FILE": runtime env vars set by update_env_var.sh.
-# Must match the flag used in user_data.sh and restart.sh. user_data.sh creates
-# the file on first boot; we `touch` it here defensively in case that step was
-# ever skipped (legacy instances, repaired bootstrap).
+# Replicate openclaw-current's runtime config: same env vars, volumes,
+# restart policy, command. Only host port and name change. --env-file must
+# match user_data.sh / restart.sh; touch is defensive for legacy instances.
 CONTAINER_ENV_FILE="$EFS_MOUNT/config/container.env"
 if [ ! -f "$CONTAINER_ENV_FILE" ]; then
   touch "$CONTAINER_ENV_FILE"
