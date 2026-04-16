@@ -36,9 +36,40 @@ echo "[$(date)] Docker Hub login OK"
 echo "[$(date)] Pulling image: ${docker_image}"
 docker pull "${docker_image}"
 
-# --- 4. Crear configuración de OpenClaw (trusted-proxy, sin pairing) ---
+# --- 4a. Gateway password — persist the terraform-minted password everywhere ---
+# The password lives in FOUR places that MUST stay aligned:
+#   1. Terraform output "access_password" → orchestrator DB column `access_password`
+#      → "Reveal Password" wizard in the Orquestio portal. Source of truth at
+#      provisioning time; terraform seeds it via ${gateway_password}.
+#   2. AWS Secrets Manager → "orquestio/instances/<id>/gateway-password". Mirror
+#      maintained by user_data (bootstrap) and rotate_password.sh (rotations).
+#   3. /mnt/efs/config/container.env → OPENCLAW_GATEWAY_PASSWORD (read at docker run).
+#   4. openclaw.json → gateway.auth.password (must match the env var or OpenClaw
+#      v2026.4.10 auto-rotates gateway.auth.mode to token on restart, breaking
+#      the nginx cookie wall).
+#   5. /etc/nginx/conf.d/gateway-auth.conf → SHA-256(password) cookie map.
+# rotate_password.sh mutates 2-5 atomically (not 1 — that column only applies
+# to the INITIAL provisioned password).
+GATEWAY_PASSWORD="${gateway_password}"
+GATEWAY_SECRET_NAME="orquestio/instances/${instance_id}/gateway-password"
+echo "[$(date)] Mirroring gateway password to Secrets Manager: $GATEWAY_SECRET_NAME"
+if aws secretsmanager describe-secret --secret-id "$GATEWAY_SECRET_NAME" --region ${aws_region} >/dev/null 2>&1; then
+  aws secretsmanager put-secret-value \
+    --secret-id "$GATEWAY_SECRET_NAME" \
+    --secret-string "$GATEWAY_PASSWORD" \
+    --region ${aws_region} >/dev/null
+else
+  aws secretsmanager create-secret \
+    --name "$GATEWAY_SECRET_NAME" \
+    --secret-string "$GATEWAY_PASSWORD" \
+    --region ${aws_region} \
+    --tags Key=Project,Value=orquestio Key=InstanceId,Value=${instance_id} >/dev/null
+fi
+GATEWAY_COOKIE_HASH=$(echo -n "$GATEWAY_PASSWORD" | sha256sum | cut -d' ' -f1)
+
+# --- 4b. Create openclaw.json with auth pinned to the bootstrap password ---
 if [ ! -f "$EFS_MOUNT/config/openclaw.json" ]; then
-  echo "[$(date)] Creating OpenClaw config (auth: trusted-proxy)..."
+  echo "[$(date)] Creating OpenClaw config (auth: trusted-proxy, password pinned)..."
   cat > "$EFS_MOUNT/config/openclaw.json" << OCCONFIG
 {
   "gateway": {
@@ -47,7 +78,8 @@ if [ ! -f "$EFS_MOUNT/config/openclaw.json" ]; then
       "mode": "trusted-proxy",
       "trustedProxy": {
         "userHeader": "X-Forwarded-User"
-      }
+      },
+      "password": "$GATEWAY_PASSWORD"
     },
     "bind": "lan",
     "port": ${container_port},
@@ -85,9 +117,9 @@ fi
 # alternate between 18789 and 18790 across subsequent upgrades.
 #
 # --env-file /mnt/efs/config/container.env: runtime env vars set by
-# update_env_var.sh. The file MUST exist before `docker run` or Docker errors
+# apply_env_vars.sh. The file MUST exist before `docker run` or Docker errors
 # out with "no such file" — we `touch` it here with 0600 perms so first boot
-# succeeds with an empty env file, and subsequent calls to update_env_var.sh
+# succeeds with an empty env file, and subsequent calls to apply_env_vars.sh
 # populate it. A plain `docker restart` does NOT re-read --env-file, which is
 # why restart.sh does a full recreate (docker rm + docker run).
 CONTAINER_ENV_FILE="$EFS_MOUNT/config/container.env"
@@ -96,6 +128,17 @@ if [ ! -f "$CONTAINER_ENV_FILE" ]; then
   chmod 600 "$CONTAINER_ENV_FILE"
   chown 1000:1000 "$CONTAINER_ENV_FILE"
 fi
+# Pin OPENCLAW_GATEWAY_PASSWORD from the bootstrap secret so every
+# restart.sh recreate preserves the same value OpenClaw wrote into
+# openclaw.json. apply_env_vars.sh never touches this name.
+TMP_BOOTSTRAP_ENV=$(mktemp)
+if [ -s "$CONTAINER_ENV_FILE" ]; then
+  grep -v '^OPENCLAW_GATEWAY_PASSWORD=' "$CONTAINER_ENV_FILE" > "$TMP_BOOTSTRAP_ENV" || true
+fi
+echo "OPENCLAW_GATEWAY_PASSWORD=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
+mv "$TMP_BOOTSTRAP_ENV" "$CONTAINER_ENV_FILE"
+chmod 600 "$CONTAINER_ENV_FILE"
+chown 1000:1000 "$CONTAINER_ENV_FILE"
 
 echo "[$(date)] Starting OpenClaw container"
 docker run -d \
@@ -122,7 +165,7 @@ docker run -d \
 # custom_domain + login.html, y el 2026-04-15 se separó configure_ai_models —
 # el payload combinado superó el límite SSM Advanced de 8 KB por value, así
 # que dividimos en 3 params:
-#   - OPENCLAW_SCRIPTS_B64      → upgrade, restart, rotate_password, update_env_var
+#   - OPENCLAW_SCRIPTS_B64      → upgrade, restart, rotate_password, apply_env_vars
 #   - OPENCLAW_BYO_SCRIPTS_B64  → add_custom_domain, remove_custom_domain, login.html
 #   - OPENCLAW_AI_SCRIPTS_B64   → configure_ai_models
 # Los tres se extraen al mismo dir /opt/openclaw/scripts/.
@@ -162,8 +205,8 @@ PATH=/sbin:/bin:/usr/sbin:/usr/bin
 CRONFILE
 chmod 644 /etc/cron.d/certbot-renew
 
-# Cookie value = SHA-256 del password
-COOKIE_VALUE=$(echo -n "${gateway_password}" | sha256sum | cut -d' ' -f1)
+# Cookie value = SHA-256 del password (bootstrap; rotate_password.sh rewrites this later)
+COOKIE_VALUE="$GATEWAY_COOKIE_HASH"
 
 # Login page con branding Orquestio — extraído del tar.gz a /opt/openclaw/scripts/login.html
 # El bloque inline original fue removido en Phase C Plan B (excedía el
@@ -182,11 +225,10 @@ upstream openclaw_backend {
 }
 UPSTREAMCONF
 
-# Cookie auth map — vive en conf.d/ (NO inline en nginx.conf) para que
-# rotate_password.sh pueda reescribirlo atómicamente y `systemctl reload
-# nginx` sin tocar nginx.conf ni el server block. Si este map vive inline
-# duplicado en http {}, la definición inline gana (last-defined-wins) y
-# toda rotación posterior queda invisible — login se rompe. No mover.
+# Cookie auth map — separado para que rotate_password.sh pueda reescribirlo
+# atómicamente y hacer `systemctl reload nginx` sin tocar nginx.conf ni el
+# server block. Debe ir en conf.d/ (se incluye ANTES del server block vía
+# include /etc/nginx/conf.d/*.conf en nginx.conf).
 cat > /etc/nginx/conf.d/gateway-auth.conf << GWAUTHCONF
 # Managed by /opt/openclaw/scripts/rotate_password.sh — do not edit by hand.
 # Cookie oc_session value = SHA-256(OPENCLAW_GATEWAY_PASSWORD).
@@ -206,10 +248,10 @@ GWAUTHCONF
 cat > /etc/nginx/nginx.conf << NGINXCONF
 events { worker_connections 1024; }
 http {
-    # Cloudflare termina TLS y proxea HTTP al origen. Sin este flag, un
-    # `return 302 /login` emite Location absoluto con el $scheme del origen
-    # (http) — el browser sale de HTTPS y la cookie Secure no se setea.
-    # Redirect relativo evita el problema.
+    # Cloudflare terminates TLS and proxies HTTP to the origin. Without
+    # this flag, `return 302 /login` emits an absolute Location built from
+    # the origin's $scheme (http) — the browser drops out of HTTPS and the
+    # Secure cookie fails. Relative redirects sidestep the whole mess.
     absolute_redirect off;
     map_hash_bucket_size 128;
 
@@ -233,9 +275,11 @@ http {
         }
 
         # Logout: expira la cookie oc_session en el browser y redirige a
-        # /login. Serverless — ningún estado server-side que invalidar.
+        # /login. Serverless — ningún estado server-side que invalidar (el
+        # password vive; esto es solo "borrar la cookie de este device").
         # Para invalidar TODAS las sesiones usar rotate_password desde el
-        # portal (todas las cookies existentes dejan de matchear el map).
+        # portal (genera password nuevo → todas las cookies existentes
+        # dejan de matchear el map de conf.d/gateway-auth.conf).
         location = /orquestio-logout {
             add_header Set-Cookie "oc_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
             return 302 /login;
