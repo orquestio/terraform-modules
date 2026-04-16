@@ -99,18 +99,22 @@ os.chown(config_file, 1000, 1000)
 print(f"Configured {len(providers_in)} AI provider(s)")
 PYEOF
 
-echo "[$(date)] Restarting OpenClaw container to apply config..."
-docker restart openclaw-current
-sleep 5
-
-# Verify container is running
-if docker ps --format '{{.Names}}' | grep -q openclaw-current; then
-    echo "[$(date)] OpenClaw restarted successfully with new AI model config"
-else
-    echo "ERROR: OpenClaw container failed to restart after config change"
-    # Restore backup
+echo "[$(date)] Recreating OpenClaw container to apply config..."
+# Use restart.sh (full docker rm + docker run) instead of `docker restart`.
+# Reasons:
+#   1. restart.sh reloads --env-file so OPENCLAW_GATEWAY_PASSWORD / env
+#      vars set via update_env_var.sh actually propagate. Plain `docker
+#      restart` keeps the env from the original docker run.
+#   2. OpenClaw v2026.4.10 on a soft restart can flip gateway.auth.mode
+#      (trusted-proxy → token) if it detects env/config drift, which
+#      invalidates the nginx cookie wall and locks users out. A full
+#      recreate starts OpenClaw from a clean slate against the pinned
+#      openclaw.json + container.env, avoiding the flip.
+if ! bash /opt/openclaw/scripts/restart.sh; then
+    echo "ERROR: restart.sh failed after config change; restoring backup"
     cp "$CONFIG_FILE.bak" "$CONFIG_FILE"
     chown 1000:1000 "$CONFIG_FILE"
-    docker start openclaw-current
+    bash /opt/openclaw/scripts/restart.sh || true
     exit 1
 fi
+echo "[$(date)] OpenClaw recreated successfully with new AI model config"
