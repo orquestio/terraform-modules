@@ -182,6 +182,20 @@ upstream openclaw_backend {
 }
 UPSTREAMCONF
 
+# Cookie auth map — vive en conf.d/ (NO inline en nginx.conf) para que
+# rotate_password.sh pueda reescribirlo atómicamente y `systemctl reload
+# nginx` sin tocar nginx.conf ni el server block. Si este map vive inline
+# duplicado en http {}, la definición inline gana (last-defined-wins) y
+# toda rotación posterior queda invisible — login se rompe. No mover.
+cat > /etc/nginx/conf.d/gateway-auth.conf << GWAUTHCONF
+# Managed by /opt/openclaw/scripts/rotate_password.sh — do not edit by hand.
+# Cookie oc_session value = SHA-256(OPENCLAW_GATEWAY_PASSWORD).
+map \$cookie_oc_session \$auth_ok {
+    "$COOKIE_VALUE" "yes";
+    default "no";
+}
+GWAUTHCONF
+
 # Nginx config principal — el server block apunta al upstream openclaw_backend
 # definido en /etc/nginx/conf.d/openclaw-upstream.conf. Cargamos TODOS los
 # archivos de conf.d/*.conf con wildcard para que add_custom_domain.sh pueda
@@ -192,14 +206,14 @@ UPSTREAMCONF
 cat > /etc/nginx/nginx.conf << NGINXCONF
 events { worker_connections 1024; }
 http {
+    # Cloudflare termina TLS y proxea HTTP al origen. Sin este flag, un
+    # `return 302 /login` emite Location absoluto con el $scheme del origen
+    # (http) — el browser sale de HTTPS y la cookie Secure no se setea.
+    # Redirect relativo evita el problema.
+    absolute_redirect off;
     map_hash_bucket_size 128;
 
     include /etc/nginx/conf.d/*.conf;
-
-    map \$cookie_oc_session \$auth_ok {
-        "$COOKIE_VALUE" "yes";
-        default "no";
-    }
 
     server {
         listen 80 default_server;
@@ -216,6 +230,15 @@ http {
         location = /login {
             alias /etc/nginx/html/login.html;
             default_type text/html;
+        }
+
+        # Logout: expira la cookie oc_session en el browser y redirige a
+        # /login. Serverless — ningún estado server-side que invalidar.
+        # Para invalidar TODAS las sesiones usar rotate_password desde el
+        # portal (todas las cookies existentes dejan de matchear el map).
+        location = /orquestio-logout {
+            add_header Set-Cookie "oc_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
+            return 302 /login;
         }
 
         location = /healthz {
