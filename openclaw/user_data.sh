@@ -165,7 +165,8 @@ docker run -d \
 # custom_domain + login.html, y el 2026-04-15 se separó configure_ai_models —
 # el payload combinado superó el límite SSM Advanced de 8 KB por value, así
 # que dividimos en 3 params:
-#   - OPENCLAW_SCRIPTS_B64      → upgrade, restart, rotate_password, apply_env_vars
+#   - OPENCLAW_SCRIPTS_B64      → upgrade, restart
+#   - OPENCLAW_SEC_SCRIPTS_B64  → rotate_password, apply_env_vars, restore_gateway_auth
 #   - OPENCLAW_BYO_SCRIPTS_B64  → add_custom_domain, remove_custom_domain, login.html
 #   - OPENCLAW_AI_SCRIPTS_B64   → configure_ai_models
 # Los tres se extraen al mismo dir /opt/openclaw/scripts/.
@@ -173,7 +174,7 @@ mkdir -p /opt/openclaw/scripts /opt/openclaw
 echo "${instance_id}" > /opt/openclaw/instance_id
 chmod 644 /opt/openclaw/instance_id
 
-for param in OPENCLAW_SCRIPTS_B64 OPENCLAW_BYO_SCRIPTS_B64 OPENCLAW_AI_SCRIPTS_B64; do
+for param in OPENCLAW_SCRIPTS_B64 OPENCLAW_SEC_SCRIPTS_B64 OPENCLAW_BYO_SCRIPTS_B64 OPENCLAW_AI_SCRIPTS_B64; do
   aws ssm get-parameter --name "/orquestio/prod/$param" \
     --region ${aws_region} --query "Parameter.Value" --output text \
     | base64 -d | tar -xzf - -C /opt/openclaw/scripts/
