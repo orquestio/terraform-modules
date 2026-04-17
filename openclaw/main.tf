@@ -66,21 +66,37 @@ resource "aws_instance" "client" {
   # (/orquestio/prod/OPENCLAW_UPGRADE_SCRIPT_B64, gzip+base64 encoded).
   # Inline embedding was abandoned in Sprint 2.2 retry because the EC2
   # user_data limit is ~12 KB of plaintext and embedding upgrade.sh blew it.
-  user_data = base64encode(templatefile("${path.module}/user_data.sh", {
-    efs_id             = aws_efs_file_system.data.id
-    efs_mount_ip       = aws_efs_mount_target.data.ip_address
-    docker_image       = var.docker_image
-    container_port     = var.container_port
-    instance_id        = var.instance_id
-    gateway_password   = random_password.gateway_password.result
-    aws_region         = data.aws_region.current.name
-  }))
+  # Strip full-line bash comments (except shebang) before base64-encoding
+  # to stay within the 16384-byte user_data limit. The template file keeps
+  # comments for developer readability; this filter runs at plan time only.
+  user_data_base64 = base64encode(
+    join("\n", [
+      for line in split("\n", templatefile("${path.module}/user_data.sh", {
+        efs_id           = aws_efs_file_system.data.id
+        efs_mount_ip     = aws_efs_mount_target.data.ip_address
+        docker_image     = var.docker_image
+        container_port   = var.container_port
+        instance_id      = var.instance_id
+        gateway_password = random_password.gateway_password.result
+        aws_region       = data.aws_region.current.name
+      })) : line if length(regexall("^\\s*#([^!]|$)", line)) == 0
+    ])
+  )
 
   tags = {
     Name       = "${var.project}-${var.instance_id}"
     Project    = var.project
     InstanceId = var.instance_id
     TenantId   = var.tenant_id
+  }
+
+  # user_data is a one-shot bootstrap script. Changes to the template should
+  # never trigger an instance recreate (that would destroy client data).
+  # Without this, terraform evaluates the full rendered user_data on every
+  # plan/destroy — and if the rendered output exceeds the 16384 byte limit,
+  # terraform aborts with a validation error, blocking destroy entirely.
+  lifecycle {
+    ignore_changes = [user_data, user_data_base64]
   }
 
   depends_on = [aws_efs_mount_target.data]
