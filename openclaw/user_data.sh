@@ -314,6 +314,23 @@ NGINXCONF
 systemctl enable nginx
 systemctl start nginx
 
+# Guard: verify nginx is actually running. Intermittent failures observed
+# (ai-test-006, 2026-04-17) where systemctl start returned 0 but the
+# service died immediately after. Retry up to 3 times with a short delay.
+for attempt in 1 2 3; do
+  sleep 2
+  if systemctl is-active --quiet nginx; then
+    echo "[$(date)] nginx confirmed active (attempt $attempt)"
+    break
+  fi
+  echo "[$(date)] WARNING: nginx not active after start, retry $attempt/3..."
+  systemctl start nginx
+done
+if ! systemctl is-active --quiet nginx; then
+  echo "[$(date)] CRITICAL: nginx failed to start after 3 retries"
+  systemctl status nginx --no-pager || true
+fi
+
 echo "[$(date)] Bootstrap complete. Instance ready."
 echo "[$(date)] Access: https://${instance_id}.orquestio.com"
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
