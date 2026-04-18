@@ -81,7 +81,7 @@ if ! docker run -d \
     -e TZ=UTC \
     -v "$EFS_MOUNT/config:/home/node/.openclaw" \
     -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
-    -p "${HOST_PORT}:${CONTAINER_PORT}" \
+    -p "127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}" \
     "$CURRENT_IMAGE" \
     node openclaw.mjs gateway --bind lan --port "${CONTAINER_PORT}" \
     >/dev/null; then

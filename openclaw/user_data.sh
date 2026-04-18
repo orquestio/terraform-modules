@@ -152,7 +152,7 @@ docker run -d \
   -e TZ=UTC \
   -v "$EFS_MOUNT/config:/home/node/.openclaw" \
   -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
-  -p ${container_port}:${container_port} \
+  -p 127.0.0.1:${container_port}:${container_port} \
   "${docker_image}" \
   node openclaw.mjs gateway --bind lan --port ${container_port}
 # NOTE: entry point changed from `dist/index.js` to `openclaw.mjs` in upstream
