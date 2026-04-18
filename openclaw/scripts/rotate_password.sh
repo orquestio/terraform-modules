@@ -113,6 +113,12 @@ map \$cookie_oc_session \$auth_ok {
     "${NEW_HASH}" "yes";
     default "no";
 }
+# When cookie is valid, inject the raw token so OpenClaw doesn't show its
+# own login page. The user authenticates ONCE via our cookie wall.
+map \$cookie_oc_session \$gateway_token_header {
+    "${NEW_HASH}" "Bearer ${NEW_PASSWORD}";
+    default "";
+}
 NGINXCONF
 log "wrote ${NGINX_AUTH_CONF}"
 

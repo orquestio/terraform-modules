@@ -270,6 +270,12 @@ map \$cookie_oc_session \$auth_ok {
     "$COOKIE_VALUE" "yes";
     default "no";
 }
+# When cookie is valid, inject the raw token so OpenClaw doesn't show its
+# own login page. The user authenticates ONCE via our cookie wall.
+map \$cookie_oc_session \$gateway_token_header {
+    "$COOKIE_VALUE" "Bearer $GATEWAY_PASSWORD";
+    default "";
+}
 GWAUTHCONF
 
 # Nginx config principal — el server block apunta al upstream openclaw_backend
@@ -324,6 +330,7 @@ http {
                 return 401 '{"error":"unauthorized"}';
             }
             proxy_pass http://openclaw_backend/healthz;
+            proxy_set_header Authorization \$gateway_token_header;
         }
 
         location / {
@@ -339,6 +346,7 @@ http {
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto \$scheme;
             proxy_set_header X-Forwarded-User "client";
+            proxy_set_header Authorization \$gateway_token_header;
         }
     }
 }
