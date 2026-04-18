@@ -81,7 +81,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   try {
     const res = await fetch('/healthz');
     if (res.ok) {
-      window.location.href = '/';
+      window.location.href = '/?token=' + encodeURIComponent(pwd);
     } else {
       err.style.display = 'block';
       document.cookie = 'oc_session=;path=/;max-age=0';
