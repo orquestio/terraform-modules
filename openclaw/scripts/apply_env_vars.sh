@@ -102,7 +102,7 @@ with open(tmp_file, "w", encoding="utf-8") as f:
     if lines:
         f.write("\n")
 
-print(f"prepared {len(ordered)} user var(s); gateway_password_preserved={gateway_line is not None}")
+print(f"prepared {len(ordered)} user var(s); infra_vars_preserved={len(preserved_lines)}")
 PYEOF
 
 mv "$TMP_ENV" "$CONTAINER_ENV_FILE"
