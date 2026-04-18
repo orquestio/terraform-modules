@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # User Data — Arranca instancia de cliente con OpenClaw
-# Auth: Nginx cookie-based login (custom page Orquestio) + trusted-proxy en OpenClaw
+# Auth: Nginx cookie-based login (custom page Orquestio) + token mode en OpenClaw
 # El cliente inicia sesión con solo el password, sin fricciones, desde cualquier dispositivo.
 # =============================================================================
 set -euo pipefail
@@ -43,10 +43,10 @@ docker pull "${docker_image}"
 #      provisioning time; terraform seeds it via ${gateway_password}.
 #   2. AWS Secrets Manager → "orquestio/instances/<id>/gateway-password". Mirror
 #      maintained by user_data (bootstrap) and rotate_password.sh (rotations).
-#   3. /mnt/efs/config/container.env → OPENCLAW_GATEWAY_PASSWORD (read at docker run).
-#   4. openclaw.json → gateway.auth.password (must match the env var or OpenClaw
-#      v2026.4.10 auto-rotates gateway.auth.mode to token on restart, breaking
-#      the nginx cookie wall).
+#   3. /mnt/efs/config/container.env → OPENCLAW_GATEWAY_PASSWORD + OPENCLAW_GATEWAY_TOKEN
+#      (both set to the same value; read at docker run via --env-file).
+#   4. openclaw.json → gateway.auth.token (must match OPENCLAW_GATEWAY_TOKEN env
+#      var or OpenClaw auto-rotates on restart, breaking auth).
 #   5. /etc/nginx/conf.d/gateway-auth.conf → SHA-256(password) cookie map.
 # rotate_password.sh mutates 2-5 atomically (not 1 — that column only applies
 # to the INITIAL provisioned password).
@@ -69,22 +69,20 @@ GATEWAY_COOKIE_HASH=$(echo -n "$GATEWAY_PASSWORD" | sha256sum | cut -d' ' -f1)
 
 # --- 4b. Create openclaw.json with auth pinned to the bootstrap password ---
 if [ ! -f "$EFS_MOUNT/config/openclaw.json" ]; then
-  echo "[$(date)] Creating OpenClaw config (auth: trusted-proxy, password pinned)..."
+  echo "[$(date)] Creating OpenClaw config (auth: token mode, cron-safe)..."
   cat > "$EFS_MOUNT/config/openclaw.json" << OCCONFIG
 {
   "gateway": {
     "mode": "local",
     "auth": {
-      "mode": "trusted-proxy",
-      "trustedProxy": {
-        "userHeader": "X-Forwarded-User"
-      },
-      "password": "$GATEWAY_PASSWORD"
+      "mode": "token",
+      "token": "$GATEWAY_PASSWORD"
     },
     "bind": "lan",
     "port": ${container_port},
-    "trustedProxies": ["172.17.0.1", "127.0.0.1"],
     "controlUi": {
+      "dangerouslyDisableDeviceAuth": true,
+      "dangerouslyAllowHostHeaderOriginFallback": true,
       "allowedOrigins": ["https://${instance_id}.orquestio.com"]
     }
   },
@@ -128,14 +126,18 @@ if [ ! -f "$CONTAINER_ENV_FILE" ]; then
   chmod 600 "$CONTAINER_ENV_FILE"
   chown 1000:1000 "$CONTAINER_ENV_FILE"
 fi
-# Pin OPENCLAW_GATEWAY_PASSWORD from the bootstrap secret so every
-# restart.sh recreate preserves the same value OpenClaw wrote into
-# openclaw.json. apply_env_vars.sh never touches this name.
+# Pin OPENCLAW_GATEWAY_PASSWORD + OPENCLAW_GATEWAY_TOKEN from the bootstrap
+# secret so every restart.sh recreate preserves the same value OpenClaw reads
+# from openclaw.json. apply_env_vars.sh never touches these names.
+# Both vars hold the same password — OPENCLAW_GATEWAY_PASSWORD is for our
+# nginx cookie wall, OPENCLAW_GATEWAY_TOKEN is what OpenClaw reads for
+# token-mode auth + loopback/cron authentication.
 TMP_BOOTSTRAP_ENV=$(mktemp)
 if [ -s "$CONTAINER_ENV_FILE" ]; then
-  grep -v '^OPENCLAW_GATEWAY_PASSWORD=' "$CONTAINER_ENV_FILE" > "$TMP_BOOTSTRAP_ENV" || true
+  grep -v '^OPENCLAW_GATEWAY_PASSWORD=' "$CONTAINER_ENV_FILE" | grep -v '^OPENCLAW_GATEWAY_TOKEN=' > "$TMP_BOOTSTRAP_ENV" || true
 fi
 echo "OPENCLAW_GATEWAY_PASSWORD=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
+echo "OPENCLAW_GATEWAY_TOKEN=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
 mv "$TMP_BOOTSTRAP_ENV" "$CONTAINER_ENV_FILE"
 chmod 600 "$CONTAINER_ENV_FILE"
 chown 1000:1000 "$CONTAINER_ENV_FILE"

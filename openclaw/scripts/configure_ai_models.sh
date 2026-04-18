@@ -115,8 +115,8 @@ echo "[$(date)] Recreating OpenClaw container to apply config..."
 #      vars set via update_env_var.sh actually propagate. Plain `docker
 #      restart` keeps the env from the original docker run.
 #   2. OpenClaw v2026.4.10 on a soft restart can flip gateway.auth.mode
-#      (trusted-proxy → token) if it detects env/config drift, which
-#      invalidates the nginx cookie wall and locks users out. A full
+#      if it detects env/config drift, which invalidates the nginx
+#      cookie wall and locks users out. A full
 #      recreate starts OpenClaw from a clean slate against the pinned
 #      openclaw.json + container.env, avoiding the flip.
 if ! bash /opt/openclaw/scripts/restart.sh; then

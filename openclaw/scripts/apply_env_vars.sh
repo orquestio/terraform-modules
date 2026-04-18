@@ -59,7 +59,7 @@ env_file = os.environ["CONTAINER_ENV_FILE"]
 tmp_file = os.environ["TMP_ENV"]
 
 NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-RESERVED = {"OPENCLAW_GATEWAY_PASSWORD"}
+RESERVED = {"OPENCLAW_GATEWAY_PASSWORD", "OPENCLAW_GATEWAY_TOKEN"}
 
 try:
     items = json.loads(payload_json)
@@ -85,18 +85,17 @@ for i, item in enumerate(items):
     ordered.pop(name, None)
     ordered[name] = value
 
-# Preserve OPENCLAW_GATEWAY_PASSWORD from existing file.
-gateway_line = None
+# Preserve OPENCLAW_GATEWAY_PASSWORD + OPENCLAW_GATEWAY_TOKEN from existing file.
+preserved_lines = []
 if os.path.exists(env_file):
     with open(env_file, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.rstrip("\n")
-            if line.startswith("OPENCLAW_GATEWAY_PASSWORD="):
-                gateway_line = line
+            if line.startswith("OPENCLAW_GATEWAY_PASSWORD=") or line.startswith("OPENCLAW_GATEWAY_TOKEN="):
+                preserved_lines.append(line)
 
 lines = [f"{k}={v}" for k, v in ordered.items()]
-if gateway_line is not None:
-    lines.append(gateway_line)
+lines.extend(preserved_lines)
 
 with open(tmp_file, "w", encoding="utf-8") as f:
     f.write("\n".join(lines))

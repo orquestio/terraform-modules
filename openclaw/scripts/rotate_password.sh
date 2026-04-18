@@ -12,12 +12,12 @@
 #   exit !=0 → failure.
 #
 # Why the full sync matters (Fase 5 bug postmortem 2026-04-15):
-#   The gateway password exists in THREE places and they MUST stay aligned:
-#     1. OPENCLAW_GATEWAY_PASSWORD in /mnt/efs/config/container.env → read by
-#        the container at `docker run` (via --env-file in restart.sh).
-#     2. openclaw.json → "gateway.auth.password" → read by OpenClaw core at
-#        startup. If env and config diverge, OpenClaw v2026.4.10 self-rotates
-#        gateway.auth.mode from trusted-proxy to token, locking users out.
+#   The gateway password exists in FOUR places that MUST stay aligned:
+#     1. OPENCLAW_GATEWAY_PASSWORD + OPENCLAW_GATEWAY_TOKEN in
+#        /mnt/efs/config/container.env → read by the container at `docker run`
+#        (via --env-file in restart.sh). Both hold the same value.
+#     2. openclaw.json → "gateway.auth.token" → read by OpenClaw core at
+#        startup. Must match OPENCLAW_GATEWAY_TOKEN env var.
 #     3. /etc/nginx/conf.d/gateway-auth.conf → nginx cookie_oc_session map →
 #        the Orquestio login wall hashes the cookie and compares against
 #        SHA-256(password). Nginx reload propagates new hash without dropping
@@ -63,9 +63,10 @@ mkdir -p "$(dirname "$CONTAINER_ENV_FILE")"
 TMP_ENV=$(mktemp)
 trap 'rm -f "$TMP_ENV"' EXIT
 if [ -f "$CONTAINER_ENV_FILE" ]; then
-  grep -v '^OPENCLAW_GATEWAY_PASSWORD=' "$CONTAINER_ENV_FILE" > "$TMP_ENV" || true
+  grep -v '^OPENCLAW_GATEWAY_PASSWORD=' "$CONTAINER_ENV_FILE" | grep -v '^OPENCLAW_GATEWAY_TOKEN=' > "$TMP_ENV" || true
 fi
 echo "OPENCLAW_GATEWAY_PASSWORD=${NEW_PASSWORD}" >> "$TMP_ENV"
+echo "OPENCLAW_GATEWAY_TOKEN=${NEW_PASSWORD}" >> "$TMP_ENV"
 mv "$TMP_ENV" "$CONTAINER_ENV_FILE"
 trap - EXIT
 chmod 600 "$CONTAINER_ENV_FILE"
@@ -82,22 +83,25 @@ with open(path) as f:
     cfg = json.load(f)
 shutil.copy2(path, path + ".bak.rotate")
 gw = cfg.setdefault("gateway", {})
-auth = gw.setdefault("auth", {"mode": "trusted-proxy",
-                               "trustedProxy": {"userHeader": "X-Forwarded-User"}})
-# Pin password inline so OpenClaw sees it matches the env var and doesn't
-# self-rotate to token mode on next startup.
-auth["password"] = pw
-# Belt-and-suspenders: force trusted-proxy; we don't use token mode.
-if auth.get("mode") != "trusted-proxy":
-    auth["mode"] = "trusted-proxy"
-    auth.setdefault("trustedProxy", {"userHeader": "X-Forwarded-User"})
-auth.pop("token", None)
+auth = gw.setdefault("auth", {})
+# Token mode: OpenClaw validates the token for all requests (including
+# internal cron/exec loopback). The nginx cookie wall remains as the
+# user-facing login layer.
+auth["mode"] = "token"
+auth["token"] = pw
+# Remove legacy trusted-proxy fields
+auth.pop("password", None)
+auth.pop("trustedProxy", None)
+# Disable device pairing (stateless token auth is sufficient)
+cui = gw.setdefault("controlUi", {})
+cui["dangerouslyDisableDeviceAuth"] = True
+cui["dangerouslyAllowHostHeaderOriginFallback"] = True
 cfg["gateway"]["auth"] = auth
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 os.chown(path, 1000, 1000)
 PYEOF
-  log "updated ${OPENCLAW_CONFIG} gateway.auth.password"
+  log "updated ${OPENCLAW_CONFIG} gateway.auth.token"
 fi
 
 # --- 3. nginx cookie map ---
