@@ -177,11 +177,27 @@ echo "${instance_id}" > /opt/openclaw/instance_id
 chmod 644 /opt/openclaw/instance_id
 
 for param in OPENCLAW_SCRIPTS_B64 OPENCLAW_SEC_SCRIPTS_B64 OPENCLAW_BYO_SCRIPTS_B64 OPENCLAW_AI_SCRIPTS_B64; do
-  aws ssm get-parameter --name "/orquestio/prod/$param" \
-    --region ${aws_region} --query "Parameter.Value" --output text \
-    | base64 -d | tar -xzf - -C /opt/openclaw/scripts/
+  BUNDLE_OK=false
+  for attempt in 1 2 3; do
+    TMP_BUNDLE=$(mktemp)
+    if aws ssm get-parameter --name "/orquestio/prod/$param" \
+         --with-decryption --region ${aws_region} \
+         --query "Parameter.Value" --output text > "$TMP_BUNDLE" 2>/dev/null; then
+      if base64 -d "$TMP_BUNDLE" | tar -xzf - -C /opt/openclaw/scripts/ 2>/dev/null; then
+        BUNDLE_OK=true
+        rm -f "$TMP_BUNDLE"
+        break
+      fi
+    fi
+    rm -f "$TMP_BUNDLE"
+    echo "[$(date)] WARNING: $param download attempt $attempt/3 failed, retrying in 3s..."
+    sleep 3
+  done
+  if [ "$BUNDLE_OK" = "false" ]; then
+    echo "[$(date)] CRITICAL: $param failed after 3 attempts"
+  fi
 done
-chmod +x /opt/openclaw/scripts/*.sh
+chmod +x /opt/openclaw/scripts/*.sh 2>/dev/null || true
 echo "[$(date)] control plane scripts installed: $(ls /opt/openclaw/scripts/)"
 
 # --- 6. CloudWatch Agent ---
@@ -212,10 +228,25 @@ chmod 644 /etc/cron.d/certbot-renew
 COOKIE_VALUE="$GATEWAY_COOKIE_HASH"
 
 # Login page con branding Orquestio — extraído del tar.gz a /opt/openclaw/scripts/login.html
-# El bloque inline original fue removido en Phase C Plan B (excedía el
-# 16384 byte limit del user_data después de añadir certbot + ACME loc).
+# Si el bundle download falló, create a minimal fallback login page.
 mkdir -p /etc/nginx/html
-cp /opt/openclaw/scripts/login.html /etc/nginx/html/login.html
+if [ -f /opt/openclaw/scripts/login.html ]; then
+  cp /opt/openclaw/scripts/login.html /etc/nginx/html/login.html
+else
+  echo "[$(date)] WARNING: login.html not found in scripts, using minimal fallback"
+  cat > /etc/nginx/html/login.html << 'FALLBACK_LOGIN'
+<!DOCTYPE html><html><head><title>Login</title></head><body>
+<h2>Login</h2><form method="POST" action="/login">
+<input name="password" type="password" placeholder="Password" required>
+<button type="submit">Login</button></form>
+<script>document.querySelector('form').addEventListener('submit',function(e){
+e.preventDefault();var p=document.querySelector('input').value;
+var h=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(p))))
+.map(b=>b.toString(16).padStart(2,'0')).join('');
+document.cookie='oc_session='+h+';path=/;secure;samesite=lax';location.href='/';});</script>
+</body></html>
+FALLBACK_LOGIN
+fi
 
 # Upstream file — este archivo lo reescribe upgrade.sh durante rolling
 # replacement para apuntar al container nuevo sin tocar el resto de la config
