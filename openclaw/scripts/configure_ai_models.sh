@@ -85,9 +85,18 @@ for p in providers_in:
 
 config["models"] = models_root
 
+# Build the agent model catalog so the UI selector only shows configured models.
+# Keys are "provider/model" IDs — OpenClaw shows exactly these in the dropdown.
+agents = config.setdefault("agents", {})
+defaults = agents.setdefault("defaults", {})
+model_catalog = {}
+for pid, prov in providers_map.items():
+    for m in prov.get("models", []):
+        full_id = f"{pid}/{m['id']}"
+        model_catalog[full_id] = {}
+defaults["models"] = model_catalog
+
 if default_provider_id and default_model_id:
-    agents = config.setdefault("agents", {})
-    defaults = agents.setdefault("defaults", {})
     defaults["model"] = f"{default_provider_id}/{default_model_id}"
 
 shutil.copy2(config_file, config_file + ".bak")
