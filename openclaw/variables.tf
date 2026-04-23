@@ -20,9 +20,8 @@ variable "ami_id" {
 }
 
 variable "docker_image" {
-  description = "Imagen Docker del producto, pineada a una versión específica del upstream (NO usar :latest). Ver orchestrator/OPENCLAW_RELEASE_POLICY.md para el procedimiento de actualización."
+  description = "Imagen Docker del producto, pineada a un tag específico del upstream. REQUERIDA sin default: la pin debe venir del blueprint seed (orchestrator/sql/seeds/openclaw.sql) para que haya una única fuente de verdad. NUNCA usar :latest. Ver orchestrator/OPENCLAW_RELEASE_POLICY.md para el procedimiento de bump."
   type        = string
-  default     = "odoopartners/openclaw:v2026.4.10"
 }
 
 variable "container_port" {
