@@ -10,7 +10,7 @@ CURRENT_NAME="openclaw-current"
 CONTAINER_PORT=18789
 PORT_A=18789
 PORT_B=18790
-HEALTH_TIMEOUT_SECONDS=60
+HEALTH_TIMEOUT_SECONDS=300
 EFS_MOUNT="/mnt/efs"
 CONTAINER_ENV_FILE="${EFS_MOUNT}/config/container.env"
 
@@ -88,11 +88,7 @@ if ! docker run -d \
     -v "$EFS_MOUNT/config:/home/node/.openclaw" \
     -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
     -v /var/lib/openclaw/plugin-runtime-deps:/home/node/.openclaw/plugin-runtime-deps \
-    --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${CONTAINER_PORT}/healthz || exit 1" \
-    --health-interval 30s \
-    --health-timeout 5s \
-    --health-retries 3 \
-    --health-start-period 1200s \
+    --no-healthcheck \
     -p "127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}" \
     "$CURRENT_IMAGE" \
     node openclaw.mjs gateway --bind lan --port "${CONTAINER_PORT}" \
@@ -124,27 +120,30 @@ if [ "$healthy" -ne 1 ]; then
   exit 6
 fi
 
-# Wait for the gateway-ready log line. /healthz responds before the gateway
-# fully wires up its handlers — accepting connections too early can leave
-# WebSocket upgrades returning 1008 for several seconds. We grep the
-# container logs for the literal string "[gateway] ready". CRITICAL: the
-# OpenClaw logger emits ANSI color codes (e.g. "\x1b[36m[gateway]\x1b[39m
-# \x1b[36mready\x1b[39m") so we must strip them before the grep, otherwise
-# the literal pattern never matches and we time out for no reason.
-log "waiting for gateway-ready log line (timeout ${HEALTH_TIMEOUT_SECONDS}s)"
+# Wait for the "http server listening" gateway log line. /healthz responds
+# before the gateway fully wires up its handlers — accepting connections too
+# early can leave WebSocket upgrades returning 1008 for several seconds. The
+# `http server listening` line proves the HTTP server (and plugin runtime
+# bootstrap) is up and ready to serve. We previously gated on `[gateway]
+# ready`, but on this image that line is emitted only after every channel
+# and sidecar (browser, etc.) finish, ~85s in — far later than needed for
+# routability. CRITICAL: the OpenClaw logger emits ANSI color codes, so we
+# must strip them before the grep, otherwise the literal pattern never
+# matches and we time out for no reason.
+log "waiting for 'http server listening' log line (timeout ${HEALTH_TIMEOUT_SECONDS}s)"
 ready_deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECONDS ))
 ready=0
 while [ "$(date +%s)" -lt "$ready_deadline" ]; do
   if docker logs "$CURRENT_NAME" 2>&1 \
        | sed "s/\x1b\[[0-9;]*m//g" \
-       | grep -qE '\[gateway\][[:space:]]+ready'; then
+       | grep -qE 'http server listening'; then
     ready=1
     break
   fi
   sleep 1
 done
 if [ "$ready" -ne 1 ]; then
-  err "container responded to /healthz but never logged '[gateway] ready' within ${HEALTH_TIMEOUT_SECONDS}s"
+  err "container responded to /healthz but never logged 'http server listening' within ${HEALTH_TIMEOUT_SECONDS}s"
   err "container logs (tail 50):"
   docker logs --tail 50 "$CURRENT_NAME" >&2 || true
   exit 6

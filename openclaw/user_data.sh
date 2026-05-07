@@ -165,11 +165,7 @@ docker run -d \
   -v "$EFS_MOUNT/config:/home/node/.openclaw" \
   -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
   -v /var/lib/openclaw/plugin-runtime-deps:/home/node/.openclaw/plugin-runtime-deps \
-  --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${container_port}/healthz || exit 1" \
-  --health-interval 30s \
-  --health-timeout 5s \
-  --health-retries 3 \
-  --health-start-period 1200s \
+  --no-healthcheck \
   -p 127.0.0.1:${container_port}:${container_port} \
   "${docker_image}" \
   node openclaw.mjs gateway --bind lan --port ${container_port}
