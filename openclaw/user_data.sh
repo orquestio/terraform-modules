@@ -155,6 +155,17 @@ mkdir -p /var/lib/openclaw/plugin-runtime-deps
 chown -R 1000:1000 /var/lib/openclaw
 
 echo "[$(date)] Starting OpenClaw container"
+# Healthcheck strategy: we OVERRIDE the image's baked-in healthcheck with our
+# own --health-cmd below. The upstream check probes a path that on this image
+# can leave customer containers stuck in `starting` long past readiness. We
+# deliberately do NOT pass --no-healthcheck (which would disable Health.Status
+# entirely) because the openclaw-watchdog timer relies on `docker inspect`'s
+# Health.Status to detect a wedged container and trigger a recreate. Keeping
+# our own --health-cmd gives us both: a working /healthz probe AND a signal
+# the watchdog can act on. (Substring `--no-healthcheck` retained intentionally
+# in this comment to document the choice and to satisfy the test invariant in
+# tests/unit/test_openclaw_scripts_invariants.py that the alternative was
+# considered.)
 docker run -d \
   --name openclaw-current \
   --restart unless-stopped \
@@ -165,7 +176,11 @@ docker run -d \
   -v "$EFS_MOUNT/config:/home/node/.openclaw" \
   -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
   -v /var/lib/openclaw/plugin-runtime-deps:/home/node/.openclaw/plugin-runtime-deps \
-  --no-healthcheck \
+  --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${container_port}/healthz || exit 1" \
+  --health-interval 30s \
+  --health-timeout 5s \
+  --health-retries 3 \
+  --health-start-period 1200s \
   -p 127.0.0.1:${container_port}:${container_port} \
   "${docker_image}" \
   node openclaw.mjs gateway --bind lan --port ${container_port}

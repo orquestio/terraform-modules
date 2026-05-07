@@ -125,6 +125,10 @@ mkdir -p /var/lib/openclaw/plugin-runtime-deps
 chown -R 1000:1000 /var/lib/openclaw 2>/dev/null || true
 
 log "starting '$NEW_NAME' on host port ${NEW_HOST_PORT}"
+# Healthcheck strategy: see user_data.sh for the rationale. We override the
+# image's baked-in healthcheck (which can leave the container stuck in
+# `starting`) with our own --health-cmd, rather than passing --no-healthcheck,
+# so the openclaw-watchdog timer still has a Health.Status signal to act on.
 docker run -d \
   --name "$NEW_NAME" \
   --restart unless-stopped \
@@ -135,7 +139,11 @@ docker run -d \
   -v "$EFS_MOUNT/config:/home/node/.openclaw" \
   -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
   -v /var/lib/openclaw/plugin-runtime-deps:/home/node/.openclaw/plugin-runtime-deps \
-  --no-healthcheck \
+  --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${CONTAINER_PORT}/healthz || exit 1" \
+  --health-interval 30s \
+  --health-timeout 5s \
+  --health-retries 3 \
+  --health-start-period 1200s \
   -p "127.0.0.1:${NEW_HOST_PORT}:${CONTAINER_PORT}" \
   "$TARGET_IMAGE" \
   node openclaw.mjs gateway --bind lan --port "${CONTAINER_PORT}" \

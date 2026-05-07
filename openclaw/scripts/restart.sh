@@ -77,6 +77,9 @@ if ! docker rm "$CURRENT_NAME" >/dev/null; then
 fi
 
 # Recreate. Flags kept in sync with user_data.sh / upgrade.sh step 2.
+# Healthcheck strategy: see user_data.sh. We override the image's baked-in
+# healthcheck rather than passing --no-healthcheck, so the watchdog still has
+# a Health.Status signal to act on.
 log "recreating '$CURRENT_NAME' on host port ${HOST_PORT} with image ${CURRENT_IMAGE}"
 if ! docker run -d \
     --name "$CURRENT_NAME" \
@@ -88,7 +91,11 @@ if ! docker run -d \
     -v "$EFS_MOUNT/config:/home/node/.openclaw" \
     -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
     -v /var/lib/openclaw/plugin-runtime-deps:/home/node/.openclaw/plugin-runtime-deps \
-    --no-healthcheck \
+    --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${CONTAINER_PORT}/healthz || exit 1" \
+    --health-interval 30s \
+    --health-timeout 5s \
+    --health-retries 3 \
+    --health-start-period 1200s \
     -p "127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}" \
     "$CURRENT_IMAGE" \
     node openclaw.mjs gateway --bind lan --port "${CONTAINER_PORT}" \
