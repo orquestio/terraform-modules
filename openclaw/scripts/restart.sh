@@ -76,6 +76,19 @@ if ! docker rm "$CURRENT_NAME" >/dev/null; then
   exit 5
 fi
 
+# Clear any stale plugin-runtime mirror locks left behind by the previous
+# container. A `.openclaw-runtime-mirror.lock` directory inside
+# plugin-runtime-deps survives `docker rm` (it lives on the host bind mount)
+# and, if not removed, causes OpenClaw to stall during plugin startup —
+# /healthz answers but the gateway never finishes wiring up. Targeted removal
+# (only the lock dirs) preserves the cached deps that make subsequent boots
+# fast; pre_start_wipe.sh is the heavier hammer reserved for watchdog-driven
+# recoveries.
+log "clearing stale .openclaw-runtime-mirror.lock dirs (if any)"
+find /var/lib/openclaw/plugin-runtime-deps \
+     -mindepth 1 -maxdepth 6 -type d -name '.openclaw-runtime-mirror.lock' \
+     -exec rm -rf {} + 2>/dev/null || true
+
 # Recreate. Flags kept in sync with user_data.sh / upgrade.sh step 2.
 # Healthcheck strategy: see user_data.sh. We override the image's baked-in
 # healthcheck rather than passing --no-healthcheck, so the watchdog still has
