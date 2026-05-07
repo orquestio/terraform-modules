@@ -58,6 +58,12 @@ if [ ! -f "$CONTAINER_ENV_FILE" ]; then
   chmod 600 "$CONTAINER_ENV_FILE"
 fi
 
+# Defensive mkdir for legacy instances bootstrapped before the
+# plugin-runtime-deps local-SSD bind mount was introduced. See user_data.sh
+# step 5 and OPENCLAW_AUTH_AND_PROXY.md (issue #1 — cache loop on EFS).
+mkdir -p /var/lib/openclaw/plugin-runtime-deps
+chown -R 1000:1000 /var/lib/openclaw 2>/dev/null || true
+
 log "stopping '$CURRENT_NAME'"
 if ! docker stop "$CURRENT_NAME" >/dev/null; then
   err "docker stop failed; container still running, aborting without recreate"
@@ -81,6 +87,12 @@ if ! docker run -d \
     -e TZ=UTC \
     -v "$EFS_MOUNT/config:/home/node/.openclaw" \
     -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
+    -v /var/lib/openclaw/plugin-runtime-deps:/home/node/.openclaw/plugin-runtime-deps \
+    --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${CONTAINER_PORT}/healthz || exit 1" \
+    --health-interval 30s \
+    --health-timeout 5s \
+    --health-retries 3 \
+    --health-start-period 1200s \
     -p "127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}" \
     "$CURRENT_IMAGE" \
     node openclaw.mjs gateway --bind lan --port "${CONTAINER_PORT}" \
@@ -107,6 +119,32 @@ done
 
 if [ "$healthy" -ne 1 ]; then
   err "health check failed within ${HEALTH_TIMEOUT_SECONDS}s after recreate"
+  err "container logs (tail 50):"
+  docker logs --tail 50 "$CURRENT_NAME" >&2 || true
+  exit 6
+fi
+
+# Wait for the gateway-ready log line. /healthz responds before the gateway
+# fully wires up its handlers — accepting connections too early can leave
+# WebSocket upgrades returning 1008 for several seconds. We grep the
+# container logs for the literal string "[gateway] ready". CRITICAL: the
+# OpenClaw logger emits ANSI color codes (e.g. "\x1b[36m[gateway]\x1b[39m
+# \x1b[36mready\x1b[39m") so we must strip them before the grep, otherwise
+# the literal pattern never matches and we time out for no reason.
+log "waiting for gateway-ready log line (timeout ${HEALTH_TIMEOUT_SECONDS}s)"
+ready_deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECONDS ))
+ready=0
+while [ "$(date +%s)" -lt "$ready_deadline" ]; do
+  if docker logs "$CURRENT_NAME" 2>&1 \
+       | sed "s/\x1b\[[0-9;]*m//g" \
+       | grep -qE '\[gateway\][[:space:]]+ready'; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ready" -ne 1 ]; then
+  err "container responded to /healthz but never logged '[gateway] ready' within ${HEALTH_TIMEOUT_SECONDS}s"
   err "container logs (tail 50):"
   docker logs --tail 50 "$CURRENT_NAME" >&2 || true
   exit 6

@@ -96,6 +96,12 @@ auth.pop("trustedProxy", None)
 cui = gw.setdefault("controlUi", {})
 cui["dangerouslyDisableDeviceAuth"] = True
 cui["dangerouslyAllowHostHeaderOriginFallback"] = True
+# Preserve / seed trustedProxies — without this, OpenClaw rejects WebSocket
+# upgrades from nginx (172.17.0.1 = docker bridge) with code 1008 and the
+# browser surfaces a 1006. See OPENCLAW_AUTH_AND_PROXY.md invariant 1. We
+# only seed when missing to avoid clobbering an operator-customised list.
+if "trustedProxies" not in gw or not isinstance(gw.get("trustedProxies"), list):
+    gw["trustedProxies"] = ["172.17.0.1", "127.0.0.1", "::1"]
 cfg["gateway"]["auth"] = auth
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
@@ -117,6 +123,13 @@ map \$cookie_oc_session \$auth_ok {
 # own login page. The user authenticates ONCE via our cookie wall.
 map \$cookie_oc_session \$gateway_token_header {
     "${NEW_HASH}" "Bearer ${NEW_PASSWORD}";
+    default "";
+}
+# Raw token (no Bearer prefix) for the location = / rewrite
+# (?token=PASS). Required for the SPA to skip its native token prompt.
+# See OPENCLAW_AUTH_AND_PROXY.md invariant 2.
+map \$cookie_oc_session \$oc_token {
+    "${NEW_HASH}" "${NEW_PASSWORD}";
     default "";
 }
 NGINXCONF

@@ -117,6 +117,13 @@ if [ ! -f "$CONTAINER_ENV_FILE" ]; then
   chmod 600 "$CONTAINER_ENV_FILE"
 fi
 
+# See user_data.sh / OPENCLAW_AUTH_AND_PROXY.md issue #1: plugin-runtime-deps
+# bind-mounted to local SSD to avoid the upstream cache-validator infinite
+# loop that EFS amplifies into a 100% I/O wait pegging. Defensive mkdir for
+# legacy hosts that bootstrapped before this mitigation.
+mkdir -p /var/lib/openclaw/plugin-runtime-deps
+chown -R 1000:1000 /var/lib/openclaw 2>/dev/null || true
+
 log "starting '$NEW_NAME' on host port ${NEW_HOST_PORT}"
 docker run -d \
   --name "$NEW_NAME" \
@@ -127,6 +134,12 @@ docker run -d \
   -e TZ=UTC \
   -v "$EFS_MOUNT/config:/home/node/.openclaw" \
   -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
+  -v /var/lib/openclaw/plugin-runtime-deps:/home/node/.openclaw/plugin-runtime-deps \
+  --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${CONTAINER_PORT}/healthz || exit 1" \
+  --health-interval 30s \
+  --health-timeout 5s \
+  --health-retries 3 \
+  --health-start-period 1200s \
   -p "127.0.0.1:${NEW_HOST_PORT}:${CONTAINER_PORT}" \
   "$TARGET_IMAGE" \
   node openclaw.mjs gateway --bind lan --port "${CONTAINER_PORT}" \
@@ -157,6 +170,34 @@ if [ "$healthy" -ne 1 ]; then
   err "old container '$CURRENT_NAME' remains active and serving traffic"
   exit 6
 fi
+
+# Wait for "[gateway] ready" log line — same rationale as restart.sh: the
+# /healthz endpoint comes online before WebSocket handlers wire up. The
+# OpenClaw logger emits ANSI color codes around the bracketed component
+# name, so we strip them before grep'ing or the literal pattern never
+# matches. See OPENCLAW_AUTH_AND_PROXY.md (debugging checklist).
+log "waiting for '[gateway] ready' on '$NEW_NAME' (timeout ${HEALTH_TIMEOUT_SECONDS}s)"
+ready_deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECONDS ))
+ready=0
+while [ "$(date +%s)" -lt "$ready_deadline" ]; do
+  if docker logs "$NEW_NAME" 2>&1 \
+       | sed "s/\x1b\[[0-9;]*m//g" \
+       | grep -qE '\[gateway\][[:space:]]+ready'; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ready" -ne 1 ]; then
+  err "'$NEW_NAME' answered /healthz but never logged '[gateway] ready' within ${HEALTH_TIMEOUT_SECONDS}s"
+  err "container logs (tail 50):"
+  docker logs --tail 50 "$NEW_NAME" >&2 || true
+  docker stop "$NEW_NAME" >/dev/null 2>&1 || true
+  docker rm   "$NEW_NAME" >/dev/null 2>&1 || true
+  err "old container '$CURRENT_NAME' remains active and serving traffic"
+  exit 6
+fi
+
 log "new container is healthy"
 
 # ---------- step 4: switch Nginx upstream to the new port ----------

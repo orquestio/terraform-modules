@@ -84,7 +84,8 @@ if [ ! -f "$EFS_MOUNT/config/openclaw.json" ]; then
       "dangerouslyDisableDeviceAuth": true,
       "dangerouslyAllowHostHeaderOriginFallback": true,
       "allowedOrigins": ["https://${instance_id}.orquestio.com"]
-    }
+    },
+    "trustedProxies": ["172.17.0.1", "127.0.0.1", "::1"]
   },
   "agents": {
     "defaults": {
@@ -142,6 +143,17 @@ mv "$TMP_BOOTSTRAP_ENV" "$CONTAINER_ENV_FILE"
 chmod 600 "$CONTAINER_ENV_FILE"
 chown 1000:1000 "$CONTAINER_ENV_FILE"
 
+# Issue #1 mitigation (upstream cache validator infinite-loop, ref: OpenClaw
+# issue #73647 closed-as-not-planned, validated live on bakvl1 2026-05-04):
+# `plugin-runtime-deps` is rewritten on every cache-validate cycle. On EFS
+# each rewrite is amplified 5-20× by NFS metadata syscalls, pegging the
+# container at 100% I/O wait. We bind-mount it to local SSD so the loop
+# is harmless on the box. The dir lives OUTSIDE EFS specifically so it's
+# wiped on instance replacement. See OPENCLAW_AUTH_AND_PROXY.md and the
+# pre_start_wipe.sh / openclaw-watchdog.service installed below.
+mkdir -p /var/lib/openclaw/plugin-runtime-deps
+chown -R 1000:1000 /var/lib/openclaw
+
 echo "[$(date)] Starting OpenClaw container"
 docker run -d \
   --name openclaw-current \
@@ -152,6 +164,12 @@ docker run -d \
   -e TZ=UTC \
   -v "$EFS_MOUNT/config:/home/node/.openclaw" \
   -v "$EFS_MOUNT/workspace:/home/node/.openclaw/workspace" \
+  -v /var/lib/openclaw/plugin-runtime-deps:/home/node/.openclaw/plugin-runtime-deps \
+  --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${container_port}/healthz || exit 1" \
+  --health-interval 30s \
+  --health-timeout 5s \
+  --health-retries 3 \
+  --health-start-period 1200s \
   -p 127.0.0.1:${container_port}:${container_port} \
   "${docker_image}" \
   node openclaw.mjs gateway --bind lan --port ${container_port}
@@ -276,6 +294,13 @@ map \$cookie_oc_session \$gateway_token_header {
     "$COOKIE_VALUE" "Bearer $GATEWAY_PASSWORD";
     default "";
 }
+# Raw token for the location = / rewrite (?token=PASS) so the OpenClaw SPA
+# never falls back to its native "paste your token" prompt when localStorage
+# is empty but our cookie is valid. See OPENCLAW_AUTH_AND_PROXY.md invariant 2.
+map \$cookie_oc_session \$oc_token {
+    "$COOKIE_VALUE" "$GATEWAY_PASSWORD";
+    default "";
+}
 GWAUTHCONF
 
 # Nginx config principal — el server block apunta al upstream openclaw_backend
@@ -333,6 +358,41 @@ http {
             proxy_set_header Authorization \$gateway_token_header;
         }
 
+        # location = / handles the SPA root. We rewrite /  →  /?token=PASS so
+        # the OpenClaw SPA picks up the token from query string and never
+        # shows its native "paste your token" prompt. CRITICAL: WebSocket
+        # upgrades come in on / too — we MUST skip the rewrite when
+        # Upgrade: websocket is set, otherwise we return 302 instead of 101
+        # and the browser surfaces a 1006 disconnect.
+        # See orchestrator/docs/OPENCLAW_AUTH_AND_PROXY.md invariant 3.
+        location = / {
+            if (\$auth_ok = "no") {
+                return 302 /login;
+            }
+            set \$do_redirect "yes";
+            if (\$http_upgrade = "websocket") {
+                set \$do_redirect "no";
+            }
+            if (\$arg_token != "") {
+                set \$do_redirect "no";
+            }
+            if (\$do_redirect = "yes") {
+                rewrite ^ "/?token=\$oc_token" redirect;
+            }
+            proxy_pass http://openclaw_backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header X-Forwarded-User "client";
+            proxy_set_header Authorization \$gateway_token_header;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+
         location / {
             if (\$auth_ok = "no") {
                 return 302 /login;
@@ -347,6 +407,8 @@ http {
             proxy_set_header X-Forwarded-Proto \$scheme;
             proxy_set_header X-Forwarded-User "client";
             proxy_set_header Authorization \$gateway_token_header;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
         }
     }
 }
@@ -371,6 +433,79 @@ if ! systemctl is-active --quiet nginx; then
   echo "[$(date)] CRITICAL: nginx failed to start after 3 retries"
   systemctl status nginx --no-pager || true
 fi
+
+# --- 8. Watchdog: detect cache-loop wedges and recover automatically ---
+# Issue #1 mitigation (OpenClaw cache validator infinite-loop). Even with the
+# local-SSD bind mount, a wedged container can still report unhealthy. The
+# watchdog monitors `docker inspect --format '{{.State.Health.Status}}'` and
+# if we see `unhealthy` 3 consecutive checks (with a 600s cooldown between
+# recoveries to avoid restart storms) we wipe plugin-runtime-deps and
+# recreate via restart.sh.
+mkdir -p /usr/local/bin
+cat > /usr/local/bin/openclaw-watchdog.sh << 'WATCHDOG_SH'
+#!/bin/bash
+set -euo pipefail
+STATE=/var/lib/openclaw/.watchdog_state
+COOLDOWN=600
+NOW=$(date +%s)
+# Track consecutive unhealthy
+UNHEALTHY_COUNT=0
+LAST_RECOVERY=0
+if [ -f "$STATE" ]; then
+  source "$STATE"
+fi
+HEALTH=$(docker inspect --format '{{.State.Health.Status}}' openclaw-current 2>/dev/null || echo "missing")
+case "$HEALTH" in
+  unhealthy)
+    UNHEALTHY_COUNT=$(( UNHEALTHY_COUNT + 1 ))
+    ;;
+  *)
+    UNHEALTHY_COUNT=0
+    ;;
+esac
+if [ "$UNHEALTHY_COUNT" -ge 3 ] && [ $(( NOW - LAST_RECOVERY )) -ge "$COOLDOWN" ]; then
+  echo "[$(date -u +%FT%TZ)] [watchdog] unhealthy x${UNHEALTHY_COUNT}; wiping plugin-runtime-deps and restarting"
+  bash /opt/openclaw/scripts/pre_start_wipe.sh || true
+  bash /opt/openclaw/scripts/restart.sh || true
+  UNHEALTHY_COUNT=0
+  LAST_RECOVERY=$NOW
+fi
+mkdir -p "$(dirname "$STATE")"
+{
+  echo "UNHEALTHY_COUNT=$UNHEALTHY_COUNT"
+  echo "LAST_RECOVERY=$LAST_RECOVERY"
+} > "$STATE"
+WATCHDOG_SH
+chmod +x /usr/local/bin/openclaw-watchdog.sh
+
+cat > /etc/systemd/system/openclaw-watchdog.service << 'WATCHDOG_SERVICE'
+[Unit]
+Description=OpenClaw container watchdog (cache-loop recovery)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/openclaw-watchdog.sh
+WATCHDOG_SERVICE
+
+cat > /etc/systemd/system/openclaw-watchdog.timer << 'WATCHDOG_TIMER'
+[Unit]
+Description=Run openclaw-watchdog every 60s
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=openclaw-watchdog.service
+
+[Install]
+WantedBy=timers.target
+WATCHDOG_TIMER
+
+systemctl daemon-reload
+systemctl enable --now openclaw-watchdog.timer || true
+echo "[$(date)] openclaw-watchdog timer installed"
 
 echo "[$(date)] Bootstrap complete. Instance ready."
 echo "[$(date)] Access: https://${instance_id}.orquestio.com"

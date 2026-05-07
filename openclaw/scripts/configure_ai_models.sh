@@ -44,6 +44,15 @@ providers_json = os.environ.get("PROVIDERS_JSON", "[]")
 with open(config_file, "r") as f:
     config = json.load(f)
 
+# Defensive: ensure gateway.trustedProxies is present. We don't own this
+# field but if a stale config (provisioned before the fix) is loaded we
+# seed it so the rewrite leaves a proxy-aware config behind. Without this
+# WebSocket upgrades fail with 1008. See OPENCLAW_AUTH_AND_PROXY.md
+# invariant 1.
+gw = config.setdefault("gateway", {})
+if "trustedProxies" not in gw or not isinstance(gw.get("trustedProxies"), list):
+    gw["trustedProxies"] = ["172.17.0.1", "127.0.0.1", "::1"]
+
 providers_in = json.loads(providers_json)
 
 # OpenClaw schema (v2026.4.10): models is an object with "mode" and "providers"
