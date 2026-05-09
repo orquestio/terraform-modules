@@ -68,13 +68,13 @@ variable "domain" {
 }
 
 variable "backup_retention_days" {
-  description = "Días de retención de backups de EFS"
+  description = "Días de retención de backups del volumen de datos"
   type        = number
   default     = 7
 }
 
 variable "primary_az" {
-  description = "AZ para EFS One Zone"
+  description = "AZ para el volumen EBS gp3 de datos. EBS está atado a una sola AZ — la EC2 debe vivir en la misma AZ."
   type        = string
   default     = "us-east-1d"
 }

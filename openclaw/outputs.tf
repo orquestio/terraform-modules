@@ -18,9 +18,9 @@ output "direct_dns_record_id" {
   value       = cloudflare_record.instance_direct.id
 }
 
-output "efs_id" {
-  description = "ID del filesystem EFS"
-  value       = aws_efs_file_system.data.id
+output "data_volume_id" {
+  description = "ID del volumen EBS gp3 con los datos persistentes del producto"
+  value       = aws_ebs_volume.data.id
 }
 
 output "dns_record_id" {

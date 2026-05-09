@@ -10,15 +10,50 @@ LOG="/var/log/orquestio-bootstrap.log"
 exec > >(tee -a "$LOG") 2>&1
 echo "[$(date)] Bootstrap starting for instance: ${instance_id}"
 
-# --- 1. Montar EFS ---
-echo "[$(date)] Mounting EFS: ${efs_id} via IP ${efs_mount_ip}"
+# --- 1. Montar volumen de datos (EBS gp3) ---
+# Migrado desde EFS One Zone el 2026-05-08. El path /mnt/efs se conserva
+# como nombre canónico — todos los control-plane scripts y los tests de
+# tests/unit/test_openclaw_*.py lo hardcodean. El filesystem detrás ahora
+# es ext4 sobre EBS gp3 (latencia ~1ms vs ~5ms de NFS), eliminando la
+# amplificación que el cache validator de OpenClaw causaba sobre EFS.
+#
+# El attachment es /dev/sdf en EC2 metadata; en Nitro (t4g.*, m6g.*) el
+# kernel lo expone como /dev/nvme1n1. Detectamos ambos para portabilidad.
+# First boot: el dispositivo viene en blanco, lo formateamos ext4. Boots
+# subsiguientes (instance replace, terraform recreate del EC2): blkid
+# detecta el filesystem existente y NO formateamos — datos preservados.
+echo "[$(date)] Locating data volume..."
+DATA_DEVICE=""
+for i in $(seq 1 30); do
+  if [ -b /dev/nvme1n1 ]; then DATA_DEVICE=/dev/nvme1n1; break; fi
+  if [ -b /dev/sdf ]; then DATA_DEVICE=/dev/sdf; break; fi
+  sleep 2
+done
+if [ -z "$DATA_DEVICE" ]; then
+  echo "[$(date)] CRITICAL: data volume not attached after 60s"
+  exit 1
+fi
+echo "[$(date)] Data volume at $DATA_DEVICE"
+
+if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
+  echo "[$(date)] First boot — formatting $DATA_DEVICE as ext4"
+  mkfs.ext4 -L orquestio-data -F "$DATA_DEVICE"
+fi
+
 EFS_MOUNT="/mnt/efs"
 mkdir -p "$EFS_MOUNT"
-mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 "${efs_mount_ip}:/" "$EFS_MOUNT"
+mount "$DATA_DEVICE" "$EFS_MOUNT"
 mkdir -p "$EFS_MOUNT/config" "$EFS_MOUNT/workspace"
 chown -R 1000:1000 "$EFS_MOUNT"
-echo "${efs_mount_ip}:/ $EFS_MOUNT nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
-echo "[$(date)] EFS mounted"
+
+# Persistir mount via UUID (immune a renumeración nvme tras kernel update
+# o instance type migration). nofail evita que el boot se cuelgue si el
+# volumen no estuviese attached por error de orquestación.
+DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE")
+if ! grep -q "$EFS_MOUNT" /etc/fstab; then
+  echo "UUID=$DATA_UUID $EFS_MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+echo "[$(date)] Data volume mounted on $EFS_MOUNT"
 
 # --- 2. Docker Hub login (imagen privada) ---
 echo "[$(date)] Logging into Docker Hub..."
@@ -445,78 +480,42 @@ if ! systemctl is-active --quiet nginx; then
   systemctl status nginx --no-pager || true
 fi
 
-# --- 8. Watchdog: detect cache-loop wedges and recover automatically ---
-# Issue #1 mitigation (OpenClaw cache validator infinite-loop). Even with the
-# local-SSD bind mount, a wedged container can still report unhealthy. The
-# watchdog monitors `docker inspect --format '{{.State.Health.Status}}'` and
-# if we see `unhealthy` 3 consecutive checks (with a 600s cooldown between
-# recoveries to avoid restart storms) we wipe plugin-runtime-deps and
-# recreate via restart.sh.
-mkdir -p /usr/local/bin
-cat > /usr/local/bin/openclaw-watchdog.sh << 'WATCHDOG_SH'
-#!/bin/bash
-set -euo pipefail
-STATE=/var/lib/openclaw/.watchdog_state
-COOLDOWN=600
-NOW=$(date +%s)
-# Track consecutive unhealthy
-UNHEALTHY_COUNT=0
-LAST_RECOVERY=0
-if [ -f "$STATE" ]; then
-  source "$STATE"
-fi
-HEALTH=$(docker inspect --format '{{.State.Health.Status}}' openclaw-current 2>/dev/null || echo "missing")
-case "$HEALTH" in
-  unhealthy)
-    UNHEALTHY_COUNT=$(( UNHEALTHY_COUNT + 1 ))
-    ;;
-  *)
-    UNHEALTHY_COUNT=0
-    ;;
-esac
-if [ "$UNHEALTHY_COUNT" -ge 3 ] && [ $(( NOW - LAST_RECOVERY )) -ge "$COOLDOWN" ]; then
-  echo "[$(date -u +%FT%TZ)] [watchdog] unhealthy x${UNHEALTHY_COUNT}; wiping plugin-runtime-deps and restarting"
-  bash /opt/openclaw/scripts/pre_start_wipe.sh || true
-  bash /opt/openclaw/scripts/restart.sh || true
-  UNHEALTHY_COUNT=0
-  LAST_RECOVERY=$NOW
-fi
-mkdir -p "$(dirname "$STATE")"
-{
-  echo "UNHEALTHY_COUNT=$UNHEALTHY_COUNT"
-  echo "LAST_RECOVERY=$LAST_RECOVERY"
-} > "$STATE"
-WATCHDOG_SH
-chmod +x /usr/local/bin/openclaw-watchdog.sh
-
-cat > /etc/systemd/system/openclaw-watchdog.service << 'WATCHDOG_SERVICE'
-[Unit]
-Description=OpenClaw container watchdog (cache-loop recovery)
-After=docker.service
-Wants=docker.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/openclaw-watchdog.sh
-WATCHDOG_SERVICE
-
-cat > /etc/systemd/system/openclaw-watchdog.timer << 'WATCHDOG_TIMER'
-[Unit]
-Description=Run openclaw-watchdog every 60s
-
-[Timer]
-OnBootSec=120s
-OnUnitActiveSec=60s
-AccuracySec=5s
-Unit=openclaw-watchdog.service
-
-[Install]
-WantedBy=timers.target
-WATCHDOG_TIMER
-
-systemctl daemon-reload
-systemctl enable --now openclaw-watchdog.timer || true
-echo "[$(date)] openclaw-watchdog timer installed"
+# --- 8. Cleanup of legacy watchdog timer (eliminado 2026-05-08) ---
+# Versiones previas de este user_data instalaban un systemd timer
+# (openclaw-watchdog.timer) que cada 60s revisaba `docker inspect --format
+# '{{.State.Health.Status}}'` y si detectaba "unhealthy" 3 veces seguidas
+# llamaba a pre_start_wipe.sh + restart.sh para recrear el contenedor. Se
+# eliminó por dos razones, ambas observadas en la instancia bakvl1
+# (i-0f23f52e357a05981) durante 2026-05-08:
+#
+#   1. El cache-loop bug que justificaba el watchdog (upstream issue #73647)
+#      sólo era catastrófico cuando los datos vivían en EFS — la latencia
+#      NFS amplificaba 5-20× el costo de cada syscall del cache validator y
+#      llevaba al container a 100% I/O wait. Migrado a EBS gp3, el bucle se
+#      vuelve invisible (es lo que pasa en el laptop de un dev upstream).
+#
+#   2. El watchdog tenía un bug operativo: estaba recreando containers que
+#      se reportaban como `healthy` con streak=0, sin actualizar su state
+#      file ni dejar entries en bootstrap.log. La consecuencia neta era una
+#      recreación silenciosa cada ~13 min de un container que estaba bien;
+#      cada recreación interrumpía el chat y disparaba el reset de la sesión
+#      activa por parte de OpenClaw (.jsonl renombrado a .jsonl.reset.<ts>).
+#
+# Si en el futuro un container realmente muere (proceso node sale con error),
+# `--restart unless-stopped` del docker run en STEP 5 lo reinicia y preserva
+# el container ID. Para detectar containers atascados que no mueren pero
+# tampoco responden, se prefiere una alarma CloudWatch + alerta humana sobre
+# `--health-status` por más de 5 min, en lugar de auto-recrear sin signal.
+#
+# Si una instancia ya tiene el watchdog instalado de un user_data viejo, lo
+# desactivamos defensivamente acá. Es idempotente — fallos se ignoran.
+systemctl disable --now openclaw-watchdog.timer 2>/dev/null || true
+systemctl disable --now openclaw-watchdog.service 2>/dev/null || true
+rm -f /etc/systemd/system/openclaw-watchdog.timer
+rm -f /etc/systemd/system/openclaw-watchdog.service
+rm -f /usr/local/bin/openclaw-watchdog.sh
+rm -f /var/lib/openclaw/watchdog.state /var/lib/openclaw/.watchdog_state
+systemctl daemon-reload 2>/dev/null || true
 
 echo "[$(date)] Bootstrap complete. Instance ready."
 echo "[$(date)] Access: https://${instance_id}.orquestio.com"

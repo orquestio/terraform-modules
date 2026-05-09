@@ -25,24 +25,50 @@ resource "random_password" "gateway_password" {
 }
 
 # =============================================================================
-# EFS One Zone — Datos persistentes del producto
+# EBS gp3 — Datos persistentes del producto
 # =============================================================================
+# Migrado desde EFS One Zone el 2026-05-08. El cache validator de OpenClaw
+# (upstream issue #73647, closed-as-not-planned) escribe a /home/node/.openclaw
+# en bucle y NFS amplificaba 5-20× la latencia por syscall, llevando al
+# container a 100% I/O wait y a resets silenciosos de sesión. EBS gp3
+# entrega ~1 ms de latencia y 3000 IOPS baseline, eliminando el cuello.
+# Ver runbook: project_management/Resiliencia_OpenClaw_EBS/progreso.md.
+#
+# El path de mount sigue siendo `/mnt/efs` deliberadamente — todos los
+# scripts del módulo y los tests `tests/unit/test_openclaw_*.py` lo
+# tratan como path canónico. El nombre es legacy; el filesystem detrás
+# ahora es ext4 sobre EBS gp3.
 
-resource "aws_efs_file_system" "data" {
-  availability_zone_name = var.primary_az
-  encrypted              = true
+resource "aws_ebs_volume" "data" {
+  availability_zone = var.primary_az
+  size              = 20
+  type              = "gp3"
+  iops              = 3000
+  throughput        = 125
+  encrypted         = true
 
   tags = {
-    Name       = "${var.project}-${var.instance_id}-efs"
+    Name       = "${var.project}-${var.instance_id}-data"
     Project    = var.project
     InstanceId = var.instance_id
   }
 }
 
-resource "aws_efs_mount_target" "data" {
-  file_system_id  = aws_efs_file_system.data.id
-  subnet_id       = var.subnet_id
-  security_groups = [var.security_group_id]
+resource "aws_volume_attachment" "data" {
+  # device_name = "/dev/sdf" es el alias presentado por el block-device
+  # mapping API de EC2. En Nitro (t4g.*, m6g.*, etc.) el OS expone el
+  # volumen como /dev/nvme1n1 — el user_data detecta ambos. Mantener
+  # /dev/sdf por compatibilidad con instancias no-Nitro futuras.
+  device_name = "/dev/sdf"
+  volume_id   = aws_ebs_volume.data.id
+  instance_id = aws_instance.client.id
+
+  # Sin force_detach el destroy del attach espera unmount limpio del OS.
+  # Con OpenClaw escribiendo, esa espera puede colgarse. force_detach=true
+  # equivale a "detach" desde la consola — seguro porque el filesystem
+  # está montado read/write y el destroy del módulo implica destroy del
+  # EC2 (no es un detach standalone que dejaría datos a medio escribir).
+  force_detach = true
 }
 
 # =============================================================================
@@ -72,8 +98,6 @@ resource "aws_instance" "client" {
   user_data_base64 = base64encode(
     join("\n", [
       for line in split("\n", templatefile("${path.module}/user_data.sh", {
-        efs_id           = aws_efs_file_system.data.id
-        efs_mount_ip     = aws_efs_mount_target.data.ip_address
         docker_image     = var.docker_image
         container_port   = var.container_port
         instance_id      = var.instance_id
@@ -98,8 +122,6 @@ resource "aws_instance" "client" {
   lifecycle {
     ignore_changes = [user_data, user_data_base64]
   }
-
-  depends_on = [aws_efs_mount_target.data]
 }
 
 data "aws_region" "current" {}
@@ -166,7 +188,7 @@ resource "cloudflare_record" "instance_direct" {
 }
 
 # =============================================================================
-# AWS Backup — Snapshots diarios de EFS
+# AWS Backup — Snapshots diarios del volumen de datos (EBS)
 # =============================================================================
 
 resource "aws_backup_vault" "instance" {
@@ -174,7 +196,7 @@ resource "aws_backup_vault" "instance" {
 
   # Recovery points accumulate over time; without force_destroy, terraform
   # destroy aborts with InvalidRequestException when the vault is non-empty
-  # and the EC2/EFS/etc end up half-cleaned. force_destroy=true tells the
+  # and the EC2/EBS/etc end up half-cleaned. force_destroy=true tells the
   # AWS provider to delete every recovery point before the vault itself.
   force_destroy = true
 
@@ -232,9 +254,9 @@ resource "aws_iam_role_policy_attachment" "backup_restores" {
 }
 
 resource "aws_backup_selection" "instance" {
-  name         = "${var.project}-${var.instance_id}-efs"
+  name         = "${var.project}-${var.instance_id}-data"
   plan_id      = aws_backup_plan.instance.id
   iam_role_arn = aws_iam_role.backup.arn
 
-  resources = [aws_efs_file_system.data.arn]
+  resources = [aws_ebs_volume.data.arn]
 }
