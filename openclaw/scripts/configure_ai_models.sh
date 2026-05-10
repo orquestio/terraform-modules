@@ -2,23 +2,32 @@
 # =============================================================================
 # configure_ai_models.sh — Inject AI model provider configs into openclaw.json
 #
-# Usage: configure_ai_models.sh '<json_array_of_providers>'
+# Usage: configure_ai_models.sh '<json_payload>'
 #
-# The JSON array contains objects like:
-#   [{"provider":"openai","baseUrl":"https://api.openai.com/v1","apiKey":"sk-...","adapter":"openai-completions","model":"gpt-4o"}]
+# v28 envelope (preferred):
+#   {"mode": "merge|replace", "providers": [{...}]}
 #
-# This script:
-#   1. Reads the current openclaw.json
-#   2. Merges the AI model configs into the "models" section
-#   3. Writes back openclaw.json
-#   4. Restarts the OpenClaw container to pick up the new config
+# Legacy form (backwards-compat, treated as mode=merge):
+#   [{"provider":"openai","baseUrl":"...","apiKey":"sk-...",...}]
+#
+# Each provider object:
+#   {"provider":"openai-codex","adapter":"openai-responses",
+#    "baseUrl":"https://chatgpt.com/backend-api","apiKey":"",
+#    "model":"gpt-5.5","default":true,"reasoning":false,
+#    "auth_type":"oauth_device|api_key","auth_method":"oauth-cn"}
+#
+# Modes:
+#   merge   — leave existing models.providers entries untouched, only update
+#             the providers in the payload. DEFAULT.
+#   replace — wipe models.providers and write only the payload entries. Used
+#             only via the explicit "Reset and start fresh" UI path.
 # =============================================================================
 set -euo pipefail
 
 CONFIG_FILE="/mnt/efs/config/openclaw.json"
-PROVIDERS_JSON="$1"
+PAYLOAD="$1"
 
-if [ -z "$PROVIDERS_JSON" ]; then
+if [ -z "$PAYLOAD" ]; then
     echo "ERROR: No provider config JSON provided"
     exit 1
 fi
@@ -29,50 +38,63 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 echo "[$(date)] Configuring AI models..."
-echo "[$(date)] Providers: $(echo "$PROVIDERS_JSON" | python3 -c "import sys,json; data=json.load(sys.stdin); print(', '.join(p.get('provider','?') for p in data))")"
 
-# Use Python to merge the config since jq may not be installed on AL2023
-export CONFIG_FILE PROVIDERS_JSON
+export CONFIG_FILE PAYLOAD
 python3 << 'PYEOF'
 import json
 import os
 import shutil
 
 config_file = os.environ.get("CONFIG_FILE", "/mnt/efs/config/openclaw.json")
-providers_json = os.environ.get("PROVIDERS_JSON", "[]")
+raw = os.environ.get("PAYLOAD", "[]")
 
 with open(config_file, "r") as f:
     config = json.load(f)
 
-# Defensive: ensure gateway.trustedProxies is present. We don't own this
-# field but if a stale config (provisioned before the fix) is loaded we
-# seed it so the rewrite leaves a proxy-aware config behind. Without this
-# WebSocket upgrades fail with 1008. See OPENCLAW_AUTH_AND_PROXY.md
-# invariant 1.
+# Defensive: keep gateway.trustedProxies present (OPENCLAW_AUTH_AND_PROXY.md
+# invariant 1). Without it WebSocket upgrades fail with 1008.
 gw = config.setdefault("gateway", {})
 if "trustedProxies" not in gw or not isinstance(gw.get("trustedProxies"), list):
     gw["trustedProxies"] = ["172.17.0.1", "127.0.0.1", "::1"]
 
-providers_in = json.loads(providers_json)
+# Accept envelope or bare list. Bare list is treated as merge.
+parsed = json.loads(raw)
+if isinstance(parsed, dict):
+    mode = (parsed.get("mode") or "merge").lower()
+    providers_in = parsed.get("providers") or []
+else:
+    mode = "merge"
+    providers_in = parsed
 
-# OpenClaw schema (v2026.4.10): models is an object with "mode" and "providers"
-# map keyed by provider id. Each provider has baseUrl, apiKey, adapter and a
-# "models" array of {id, name, api, reasoning?} entries.
+if mode not in ("merge", "replace"):
+    raise SystemExit(f"ERROR: invalid mode {mode!r}, expected merge or replace")
+
+print(f"[mode={mode}] Providers in payload: {', '.join(p.get('provider','?') for p in providers_in)}")
+
 models_root = config.get("models") or {}
 if not isinstance(models_root, dict):
     models_root = {}
-models_root["mode"] = "replace"
-providers_map = {}
+
+# Preserve existing providers map by default. In replace mode we start fresh.
+existing_map = models_root.get("providers") or {}
+if not isinstance(existing_map, dict):
+    existing_map = {}
+providers_map = {} if mode == "replace" else dict(existing_map)
+
+models_root["mode"] = mode
 models_root["providers"] = providers_map
 
 default_provider_id = None
 default_model_id = None
 
 for p in providers_in:
-    pid = p.get("provider", "").strip()
+    pid = (p.get("provider") or "").strip()
     if not pid:
         continue
     model_id = p.get("model") or pid
+    auth_type = p.get("auth_type") or ""
+    api_key = p.get("apiKey") or ""
+
     model_entry = {"id": model_id, "name": model_id}
     api = p.get("adapter")
     if api:
@@ -84,8 +106,15 @@ for p in providers_in:
         "baseUrl": p.get("baseUrl", ""),
         "models": [model_entry],
     }
-    if p.get("apiKey"):
-        prov_entry["apiKey"] = p["apiKey"]
+    # OAuth providers: do NOT inject apiKey. OpenClaw resolves auth from
+    # auth-profiles.json via the provider plugin; an apiKey marker would
+    # confuse the auth-resolution chain.
+    if auth_type != "oauth_device" and api_key:
+        prov_entry["apiKey"] = api_key
+
+    auth_method = p.get("auth_method")
+    if auth_method:
+        prov_entry["authMethod"] = auth_method
 
     providers_map[pid] = prov_entry
     if p.get("default") and default_provider_id is None:
@@ -94,8 +123,7 @@ for p in providers_in:
 
 config["models"] = models_root
 
-# Build the agent model catalog so the UI selector only shows configured models.
-# Keys are "provider/model" IDs — OpenClaw shows exactly these in the dropdown.
+# Build the agent model catalog for the UI selector — keys are "provider/model".
 agents = config.setdefault("agents", {})
 defaults = agents.setdefault("defaults", {})
 model_catalog = {}
@@ -105,29 +133,29 @@ for pid, prov in providers_map.items():
         model_catalog[full_id] = {}
 defaults["models"] = model_catalog
 
+# Only update agents.defaults.model when the payload actually marks a default.
+# In merge mode, leave the existing default alone otherwise — switching
+# providers should not silently change which model the agent uses.
 if default_provider_id and default_model_id:
     defaults["model"] = f"{default_provider_id}/{default_model_id}"
+elif mode == "replace":
+    # In replace mode with no default: pick the first configured model so
+    # the agent has SOMETHING to use.
+    if model_catalog and not defaults.get("model"):
+        defaults["model"] = next(iter(model_catalog))
 
 shutil.copy2(config_file, config_file + ".bak")
 with open(config_file, "w") as f:
     json.dump(config, f, indent=2)
 
 os.chown(config_file, 1000, 1000)
-
-print(f"Configured {len(providers_in)} AI provider(s)")
+print(f"Configured {len(providers_in)} provider(s) — total now: {len(providers_map)}")
 PYEOF
 
 echo "[$(date)] Recreating OpenClaw container to apply config..."
-# Use restart.sh (full docker rm + docker run) instead of `docker restart`.
-# Reasons:
-#   1. restart.sh reloads --env-file so OPENCLAW_GATEWAY_PASSWORD / env
-#      vars set via update_env_var.sh actually propagate. Plain `docker
-#      restart` keeps the env from the original docker run.
-#   2. OpenClaw v2026.4.10 on a soft restart can flip gateway.auth.mode
-#      if it detects env/config drift, which invalidates the nginx
-#      cookie wall and locks users out. A full
-#      recreate starts OpenClaw from a clean slate against the pinned
-#      openclaw.json + container.env, avoiding the flip.
+# restart.sh does a full docker rm + docker run (see configure_ai_models.sh
+# v1 commentary): plain `docker restart` does NOT reload --env-file or
+# trigger the gateway.auth.mode flip rescue path.
 if ! bash /opt/openclaw/scripts/restart.sh; then
     echo "ERROR: restart.sh failed after config change; restoring backup"
     cp "$CONFIG_FILE.bak" "$CONFIG_FILE"
