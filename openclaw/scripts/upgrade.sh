@@ -94,6 +94,17 @@ case "$CURRENT_HOST_PORT" in
 esac
 log "new host port will be: ${NEW_HOST_PORT}"
 
+# step 0.5: self-heal openclaw.json invariants (incident 2026-05-17 — banner)
+CFG="$EFS_MOUNT/config/openclaw.json"
+if [ -f "$CFG" ] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$CFG" <<'P' || log "WARN: config-sync failed"
+import json,sys
+p=sys.argv[1];c=json.load(open(p));u=c.setdefault("update",{})
+if u.get("checkOnStart") is not False:
+    u["checkOnStart"]=False;json.dump(c,open(p,"w"),indent=2)
+P
+fi
+
 # ---------- step 1: pull target image ----------
 log "pulling ${TARGET_IMAGE}"
 if ! docker pull "$TARGET_IMAGE"; then
