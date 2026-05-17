@@ -127,6 +127,9 @@ if [ ! -f "$EFS_MOUNT/config/openclaw.json" ]; then
       "workspace": "/home/node/.openclaw/workspace"
     }
   },
+  "update": {
+    "checkOnStart": false
+  },
   "session": {
     "dmScope": "per-channel-peer"
   },
