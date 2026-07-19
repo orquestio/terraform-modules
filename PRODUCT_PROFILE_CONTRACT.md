@@ -1,209 +1,199 @@
-# Product profile contract — the shared `product_instance` engine
+# Product profile contract v2 — the shared `product_instance` engine
 
-> Status: **DRAFT for review** (2026-07-18). This is the contract the shared
-> per-tenant provisioning engine consumes. It exists to add products to Orquestio
-> **without forking the module/pipeline/scripts** — OpenClaw's battle-tested code
-> IS the engine; each product is a *profile* over it.
+> Status: **v2, revised after two Fable subagent reviews** (2026-07-18). v1 was
+> GO_WITH_CHANGES: the direction (generalize OpenClaw in place) survived, but v1
+> made three load-bearing false claims. v2 fixes all blockers and records the
+> auth decision. This is the design of record; the render/plan gate suite (below)
+> is the executable enforcement.
 
-## Principle
+## Principle (unchanged)
 
-The current `modules/openclaw/` is ~90% product-agnostic already (EBS/nvme mount,
-EIP, dual Cloudflare DNS, AWS Backup, nginx/TLS+certbot skeleton, SSM script-bundle
-fetch, `docker run` lifecycle, control-plane scripts). We **promote that code in
-place** to a single `modules/product_instance/` engine parameterized by a
-**profile**, and drive per-product differences (auth, ports, config format, run
-command) through the profile — never through a fork.
+`modules/openclaw/` is ~90% product-agnostic. We **promote it in place** to a
+single `modules/product_instance/` engine parameterized by a per-product
+**profile**. Adding a product = a new profile, not a fork. Two guarantees so
+OpenClaw (in prod) is not degraded: (1) the `openclaw` profile is
+**behavior-preserving** — render byte-identical + `plan`-zero against real prod
+state; (2) **no live instance is re-provisioned** — the engine affects new
+provisions only, gated below.
 
-Two hard guarantees so this **does not degrade OpenClaw** (which is in production):
+## What v1 got WRONG (fixed in v2)
 
-1. **Behavior-preserving for OpenClaw.** The `openclaw` profile below reproduces
-   today's rendered values byte-for-byte. Generalization is a no-op for OpenClaw.
-2. **No live instance is re-provisioned.** `user_data` runs only on first boot;
-   existing OpenClaw EC2s keep running untouched. The engine affects **new
-   provisions only**, which are gated by (a) a render-diff vs today's module and
-   (b) the existing `tests/unit/test_openclaw_*.py` golden-master invariants.
+1. **"Wiring is terraform.py-only" — FALSE.** Product coupling also lives in:
+   `config.py:62` `allowed_script_prefixes`, `control_plane.py:618-631`
+   `_SCRIPT_REFRESH_PREAMBLE` (refreshes OPENCLAW bundles into `/opt/openclaw/scripts`
+   on *every* dispatch), `admin_instances.py:66-82,554-576` `_ADMIN_OPERATIONS` +
+   upgrade endpoint + `openclaw_versions` gate, `provisioning.py:83` readiness probe,
+   and the **destroy path** (`terraform.py:205-238`, `provisioning.py:283-322`).
+2. **"Per-instance OIDC exactly as designed" — FALSE.** It did not exist in code.
+   **v2 deletes it entirely** — see Auth decision (HYBRID).
+3. **No profile→scripts transport.** The behaviors that matter (restart, upgrade
+   port alternation, env-var reservation, `IMAGE_REPO=odoopartners/openclaw`
+   `upgrade.sh:39`) run in ~10 static SSM-bundle scripts the profile couldn't reach.
+   **v2 adds the transport** below.
 
-## Profile schema
+## Auth decision — HYBRID (shared edge-wall + portal-brokered handoff)
 
-A profile is a static object selected per product. Fields marked `⟵ blueprint`
-already arrive through the fixed `terraform.py` interface (do not duplicate); the
-rest are the engine's new parameters.
+Decided by adversarial+investigative+decisive Fable review. **Rejected**:
+literal shared session (Domain=.orquestio.com cookie readable by hostile tenant
+subdomains); per-instance Zitadel OIDC (can't authorize without a Zitadel shadow
+of `subscriptions`; needs a standing mgmt service account = one box compromise →
+platform IdP compromise; keeps a human gate); basic-auth (UX + static secrets).
+
+**Chosen**: ONE shared identity — the **existing** `PRYSMID_PORTAL_CUSTOMER` OIDC
+app + portal session — is the only thing customers authenticate with. Instance
+entry is brokered:
+
+```
+portal (Prysm:ID session)
+  → POST api.orquestio.com/portal/instances/{id}/handoff   (get_current_customer + _verify_ownership; mints single-use ~60s code bound to instance_id + target host)
+  → browser 302 → https://{host}/auth/handoff?code=...
+  → instance nginx  location = /auth/handoff  → proxies to
+  → GET api.orquestio.com/auth/edge/handoff    (validates code + X-Forwarded-Host against the instance's registered domains; reads gateway password from Secrets Manager ONLY; 302→/ with Set-Cookie: oc_session=SHA256(password); Path=/; HttpOnly; Secure; SameSite=Lax — NEVER a Domain attribute)
+```
+
+Consequences:
+- **No human gate** (`human_gate_remaining=false`): reuses the existing OIDC app,
+  never touches the Zitadel management API.
+- **Hermes reuses OpenClaw's nginx wall VERBATIM** (`user_data.sh:273-455`):
+  dashboard bound to **loopback with zero native auth** (loopback ⇒ no login page,
+  no injection needed). OpenClaw keeps its Bearer-token injection.
+- **UX improves**: logged-in customer clicks Open → lands authenticated.
+- **Fail-static preserved**: valid `oc_session` cookies keep working during a
+  control-plane outage; only NEW logins need the orchestrator. Branded `/login`
+  password page stays as break-glass.
+- The profile **auth schema collapses** to 4 fields (below). Per-product native
+  auth (`HERMES_DASHBOARD_OIDC_*`, basic-auth) is **prohibited by contract**.
+
+Invariants (contract-level): no component sets a `Domain=.orquestio.com` cookie;
+the platform JWT / `jwt_secret` never reaches an instance host; instance nginx
+strips inbound `Cookie` before proxying to the product; handoff codes are
+one-shot (delete on redemption); the edge `/auth/edge/handoff` reads **only**
+Secrets Manager (fixes the `portal_instances.py:170-178` stale-DB-fallback bug —
+rotation never updates the DB column, so a DB fallback mints cookies from a
+revoked password). Custom-domain host validation on handoff is security-critical
+(skipping it = open redirect leaking session codes).
+
+## Profile schema v2
+
+`⟵ tfvar` = already flows through the fixed 15-var terraform.py interface (do NOT
+duplicate: only `docker_image` and `container_port` actually do). Everything else
+is engine data, delivered either as an HCL profile (terraform-time) or via the
+**profile→scripts transport** (runtime, for the bundle scripts).
 
 ```yaml
 profile:
-  key: string                      # identity, e.g. "openclaw" | "hermes"
-
+  key: string                         # "openclaw" | "hermes"
+  image_repo: string                  # upgrade.sh IMAGE_REPO (e.g. odoopartners/openclaw)
   container:
-    name: string                   # docker --name, e.g. "openclaw-current"
-    image: ⟵ blueprint.docker_image
-    run_command: [string]          # argv after the image; {PORT} substituted
+    name: string                      # docker --name
+    run_command: [string]             # argv after image; {PORT} substituted
+    run_as: "uid:gid"                 # 1000:1000 for openclaw (chowned in 7+ places; wrong uid → crash-loop)
     ports:
-      primary: int                 # human-facing UI port nginx fronts; == blueprint.container_port
-      health: int                  # port that serves health_endpoint (may differ from primary)
-      alt: int | null              # rolling-upgrade alternate host port (openclaw: 18790)
-      extra: [int]                 # any other ports to publish on loopback
-    health_endpoint: ⟵ blueprint.health_check_endpoint   # e.g. "/healthz"
-    readiness_log_regex: string|"" # gate restart/upgrade on this log line ("" = skip)
-    env_static: {string: string}   # HOME/TERM/TZ etc.
-    reserved_env: [string]         # infra-owned names apply_env_vars must never set
-    health_start_period: string    # docker --health-start-period
-    extra_bind_mounts: [string]    # product quirks (host:container)
-
+      # NOTE: container_port ⟵ tfvar is the human UI upstream port; do NOT restate it.
+      health: int                     # port serving health_endpoint (openclaw 18789; hermes 8642)
+      alt: int|null                   # rolling-upgrade blue/green host port (openclaw 18790; null ⇒ single-port strategy)
+      published: [string]             # exact -p specs (loopback binds)
+    health_endpoint: string           # profile-owned; MUST be synced to blueprint.health_check_endpoint (openclaw /healthz, hermes /health)
+    readiness:
+      restart_regex: string           # restart.sh gate ('http server listening')
+      upgrade_regex: string           # upgrade.sh gate ('\[gateway\] ready', ~85s later — protects traffic switch)
+      ansi_strip: bool                # both greps sed-strip ANSI first
+    docker_health: {interval,timeout,retries,max_time,start_period}  # 30s/5s/3/3s/1200s ; override-not-disable
+    restart_health_timeout_s: int     # 300 (distinct from start_period 1200)
+    env_static: [ "K=V", ... ]        # ORDERED list (map loses argv order): HOME,TERM,TZ,...
+    reserved_env: [string]            # infra-owned names apply_env_vars must reject (consumed via transport)
+    extra_bind_mounts: [string]       # openclaw: /var/lib/openclaw/plugin-runtime-deps quirk (issue #73647)
   data:
-    mount_host: string             # host mount point of the EBS data volume
-    volume_mounts: [string]        # host:container mounts (may reference {mount})
-    config_dir: string             # dir holding the product config file
-    config_file: string            # filename (relative to config_dir)
+    mount_host: string                # /mnt/efs (legacy name, ext4-on-EBS-gp3)
+    volume_mounts: [string]
+    config_dir: string
+    config_file: string               # openclaw.json | .env
     config_format: enum(json|env|yaml)
-    env_file: string               # --env-file path for user env vars
-    config_seed: string            # path to the seed template rendered on first boot
-
-  auth:
-    strategy: enum(cookie-wall|oidc|basic)   # see "Auth strategies"
-
+    env_file: string                  # --env-file (container.env)
+    config_seed: {kind: inline_heredoc, normalizations: [timestamps], preserve_literals: [...]}   # NOT a template file; runtime bash heredoc, create-if-missing
+    data_subdirs: [string]            # mkdir'd on boot (config, workspace, ...)
+    ebs: {size_gib:20, type:gp3, iops:3000, throughput:125, encrypted:true}
+    secrets_manager: {name_template: "orquestio/instances/{id}/gateway-password", tags:{...}}
+    registry_auth: {ssm: "/orquestio/prod/DOCKERHUB_TOKEN"}
+  auth:                               # HYBRID — collapsed
+    ui_upstream_port: int             # what the nginx wall proxies to (openclaw 18789; hermes 9119)
+    ui_bind: enum(loopback)           # MUST be loopback; non-loopback bind = contract violation
+    injected_credential: enum(none | bearer:<secret-ref> | query-token)   # openclaw bearer(gw pw)+query-token; hermes none
+    websocket_paths: [string]         # Upgrade-skip logic in the wall
   scripts:
-    dir: string                    # where control-plane scripts land, e.g. /opt/openclaw/scripts
-    ssm_bundles: [string]          # /orquestio/prod/<NAME> params user_data fetches
-    optional: [string]             # scripts only present for some strategies (e.g. rotate_password)
-
-  password:
-    read_command: ⟵ blueprint.password_read_command   # "reveal password" wizard
-    mirror_secrets_manager: bool   # cookie-wall mirrors gateway pw to SM; oidc may not
+    dir: string                       # /opt/<product>/scripts
+    transport: "/opt/<product>/profile.env"   # user_data writes it; EVERY bundle script sources it
+    ssm_bundles: [string]             # /orquestio/prod/<NAME>_SCRIPTS_B64
+    inventory: [string]               # FULL list incl. oauth_flow/status/probe_model/disconnect_ai_provider/pre_start_wipe/update+delete_env_var/add+remove_custom_domain
+    optional: [string]                # cookie-wall-only where applicable
+  nginx:
+    artifacts: [openclaw-upstream.conf, gateway-auth.conf, custom-domain-*.conf]   # names coupled to scripts
+  domain:
+    mode: enum(hardcode_orquestio | template)   # DECISION: v2 = hardcode_orquestio verbatim (engine supports one domain today; user_data.sh:121 allowedOrigins is behavior not cosmetics). Templating {domain} deferred as an explicit future behavior change.
+  outputs_frozen: [ec2_instance_id, public_ip, dns_record_id, access_url, access_password]  # ALL profiles, non-null (apply() hard-subscripts; KeyError → destroys fresh infra)
 ```
 
-## Reference profile — `openclaw` (reproduces today, verified against the module)
+`access_password` is redefined as an **internal machine credential** (nginx→product
+injection + the atomic revocation lever via `rotate_password.sh`), not the
+customer login. For Hermes (`injected_credential: none`) it still carries a
+break-glass password for the `/login` fallback and satisfies the frozen output.
 
-```yaml
-key: openclaw
-container:
-  name: openclaw-current
-  run_command: ["node","openclaw.mjs","gateway","--bind","lan","--port","{PORT}"]
-  ports: { primary: 18789, health: 18789, alt: 18790, extra: [] }
-  health_endpoint: /healthz
-  readiness_log_regex: "http server listening"
-  env_static: { HOME: /home/node, TERM: xterm-256color, TZ: UTC }
-  reserved_env: [OPENCLAW_GATEWAY_PASSWORD, OPENCLAW_GATEWAY_TOKEN]
-  health_start_period: 1200s
-  extra_bind_mounts:
-    - "/var/lib/openclaw/plugin-runtime-deps:/home/node/.openclaw/plugin-runtime-deps"  # issue #73647 cache-loop workaround
-data:
-  mount_host: /mnt/efs             # legacy name; ext4-on-EBS-gp3 behind it (see main.tf)
-  volume_mounts:
-    - "{mount}/config:/home/node/.openclaw"
-    - "{mount}/workspace:/home/node/.openclaw/workspace"
-  config_dir: /mnt/efs/config
-  config_file: openclaw.json
-  config_format: json
-  env_file: /mnt/efs/config/container.env
-  config_seed: seeds/openclaw.json.tmpl
-auth:
-  strategy: cookie-wall
-scripts:
-  dir: /opt/openclaw/scripts
-  ssm_bundles: [OPENCLAW_SCRIPTS_B64, OPENCLAW_SEC_SCRIPTS_B64, OPENCLAW_BYO_SCRIPTS_B64, OPENCLAW_AI_SCRIPTS_B64]
-  optional: [rotate_password.sh, restore_gateway_auth.sh, login.html]   # cookie-wall only
-password:
-  read_command: <existing blueprint value>
-  mirror_secrets_manager: true
-```
+## Orchestrator wiring inventory (all must be profile-aware, one commit-set)
 
-## Reference profile — `hermes` (the second consumer)
+- `terraform.py`: `_prepare_workspace` + `apply` tfvars + **`destroy()` reconstruction (:205-238)** + `provisioning._build_destroy_tfvars (:283-322)` — all gated on the same blueprint `profile` value. Test: every var in the generated `main.tf` is satisfiable from `_build_destroy_tfvars`. Failure prevented: post-flip `TerraformDestroyValidationError` reverts state→'running' and destroys silently no-op → **leaks EC2/EIP/EBS/Backup**.
+- `config.py:62` `allowed_script_prefixes` ← derive from `profile.scripts.dir`.
+- `control_plane.py:618-631` `_SCRIPT_REFRESH_PREAMBLE` ← refresh the profile's `ssm_bundles` into the profile's `dir` (today hardcodes OPENCLAW→/opt/openclaw/scripts on every dispatch).
+- `admin_instances.py:66-82,554-576` `_ADMIN_OPERATIONS` + upgrade endpoint ← profile-scoped (cookie-wall-only ops hidden on non-cookie-wall); `openclaw_versions` gate ← per-product analogue.
+- `provisioning.py:83` readiness probe path ← profile-driven.
+- **Deployment order**: `product_instance` must land in the orchestrator terraform-submodule bump + image rebuild BEFORE any blueprint points at it (else `shutil.copytree` FileNotFoundError at provision AND in the cleanup handler).
 
-```yaml
-key: hermes
-container:
-  name: hermes-current
-  run_command: ["gateway","run"]                 # confirm exact argv on the arm64 image
-  ports: { primary: 9119, health: 8642, alt: null, extra: [8642] }   # dashboard 9119, API+/health 8642
-  health_endpoint: /health
-  readiness_log_regex: ""                          # confirm a readiness line exists; else skip
-  env_static: { HERMES_DASHBOARD: "1", HERMES_DASHBOARD_PORT: "9119", TZ: UTC }
-  reserved_env: [HERMES_DASHBOARD_OIDC_ISSUER, HERMES_DASHBOARD_OIDC_CLIENT_ID, HERMES_DASHBOARD_BASIC_AUTH_PASSWORD]
-  health_start_period: 300s
-  extra_bind_mounts: []                            # no plugin-runtime-deps quirk
-data:
-  mount_host: /mnt/efs
-  volume_mounts:
-    - "{mount}/data:/opt/data"
-  config_dir: /mnt/efs/data
-  config_file: .env                                # + config.yaml
-  config_format: env
-  env_file: /mnt/efs/data/container.env
-  config_seed: seeds/hermes.env.tmpl
-auth:
-  strategy: oidc
-scripts:
-  dir: /opt/hermes/scripts
-  ssm_bundles: [HERMES_SCRIPTS_B64, HERMES_BYO_SCRIPTS_B64, HERMES_AI_SCRIPTS_B64]
-  optional: []
-password:
-  read_command: <basic-auth break-glass read>
-  mirror_secrets_manager: true
-```
+## Gate suite (build_plan step 2 — build FIRST, against the existing module)
 
-Items still to confirm on the real arm64 image (tracked, not invented): exact
-`gateway run` argv, the `/health` path, and whether a readiness log line exists.
+Renderer PROVEN (scratchpad/gate-harness/render): reproduces the module's
+`user_data_base64` expression via tofu builtins (no providers). Current openclaw
+golden captured: **16316/16384 bytes — only 68 bytes headroom**, so the engine
+must NOT inflate user_data (the profile→scripts transport lives on host, outside
+user_data). Full suite:
+(a) render-diff of the 4 artifacts + variables/outputs schema, byte-equal;
+(b) `plan`-zero against a COPY of a real prod tfstate under the engine (catches
+resource-address renames that would destroy `aws_ebs_volume.data`, `lifecycle
+ignore_changes` loss, provider-constraint drift vs pinned cloudflare ~>4.0);
+(c) plan-JSON structural diff for a fresh provision;
+(d) destroy-path exercise of an old-state instance through the new module;
+(e) post-comment-strip user_data byte-count < 16384;
+(f) render matrix with ≥2 distinct port/domain/instance_id tuples (openclaw's
+18789==18789 degeneracy hides substitution bugs);
+(g) re-anchor the five `test_openclaw_*` golden-master suites onto the engine's
+RENDERED openclaw-profile output (else they go vacuous, not red, after promotion).
 
-## Auth strategies — the main extension point
+## Reference profiles
 
-The engine's nginx + config-seed + env wiring branch on `auth.strategy`:
+`openclaw` and `hermes` profile values are in `profiles/openclaw.json` and
+`profiles/hermes.json` (authored alongside the engine). openclaw reproduces
+today; hermes: `run_command=[gateway,run]`, `container_port=9119` (dashboard, ⟵
+tfvar), `ports.health=8642`, `health_endpoint=/health`, `ui_bind=loopback`,
+`injected_credential=none`, `env_static` includes `HERMES_DASHBOARD_HOST=127.0.0.1`
++ `HERMES_DASHBOARD=1` + (API server disabled or `API_SERVER_HOST=127.0.0.1` +
+keyed), host-network/sidecar topology, `alt=null` ⇒ stop/replace upgrade window
+(SLO-accepted for a starter product), and a Hermes `rotate_password`-equivalent
+(cookie-map rewrite + nginx reload) for invalidation parity. Pin:
+`nousresearch/hermes-agent:v2026.7.7.2` (multi-arch confirmed).
 
-| strategy | nginx | in-container | provisioning hook |
-|---|---|---|---|
-| `cookie-wall` | SHA-256 cookie map + `login.html` + `?token=` rewrite + `/orquestio-logout` | token-mode config; `reserved_env` gateway pw/token; SM mirror | none |
-| `oidc` | plain TLS reverse proxy to `primary`; `/health`→`health` port | `.env` OIDC issuer+client_id; basic-auth break-glass | **per-instance OIDC app in Prysm:ID/Zitadel** (create on provision, delete on destroy) |
-| `basic` | nginx `auth_basic` OR native basic-auth env | basic-auth creds from `access_password` | none |
+## Build order (from the review's build_plan)
 
-`cookie-wall` keeps OpenClaw's UX exactly. `oidc` gives Hermes native Prysm:ID
-without the cookie hack. No lossy one-size-fits-all — each product keeps its UX.
-
-## Wiring — how the profile reaches the module (fixed `terraform.py`)
-
-`terraform.py:_prepare_workspace` copies **one** module dir and passes a **fixed**
-tfvar set. So:
-
-- Static profiles live **inside** the engine: `product_instance/profiles/<key>.json`,
-  selected by a single new tfvar `profile`.
-- `terraform.py` change is minimal + additive + backward-compatible: add
-  `profile` to the generated `main.tf` var + module call + `terraform.tfvars.json`
-  **only when the blueprint carries a non-null `profile`**. A new nullable
-  blueprint column `profile TEXT` drives it. OpenClaw's row stays
-  `terraform_module='modules/openclaw'`, `profile=NULL` → generated `main.tf`
-  unchanged → old module untouched. Hermes:
-  `terraform_module='modules/product_instance'`, `profile='hermes'`.
-- Per-instance secrets that can't be static (OIDC `client_id`) keep flowing via
-  the per-instance SSM param `/orquestio/prod/instances/{id}/*`, read in
-  `user_data` — exactly as already designed. The profile only holds static shape.
-
-Transition, zero prod risk:
-1. Land `product_instance/` (engine) + `profiles/openclaw.json` + `profiles/hermes.json`.
-2. Add the `profile` column + the gated `terraform.py` change.
-3. Point the **Hermes** blueprint at `product_instance` (greenfield — OpenClaw untouched).
-4. Prove equivalence, then flip the **OpenClaw** blueprint to
-   `product_instance`+`profile=openclaw` in a later, separately-tested step.
-
-## Behavior-preservation gate (render-diff)
-
-Before OpenClaw is flipped: render `product_instance` with `profile=openclaw` and
-diff the produced `user_data`, `docker run` invocation, nginx config, and
-`openclaw.json` seed against today's `modules/openclaw/` output for a fixed set of
-inputs. Must be equivalent (modulo intentional, documented normalizations). The
-existing golden-master tests ride along: `test_openclaw_scripts_invariants`,
-`test_openclaw_config_schema`, `test_openclaw_pin_coherence`,
-`test_user_data_fetches_all_ssm_params`, `test_openclaw_auth_proxy_invariants`.
-
-## What stays product-specific (correctly not shared)
-
-- The config **seed template** (`openclaw.json` vs `hermes .env`/`config.yaml`).
-- The `configure_ai_models` **mapping** (writes JSON vs YAML/env) — one script,
-  branches on `config_format`.
-- `cookie-wall`-only scripts (`rotate_password`, `restore_gateway_auth`, `login.html`).
-- The OpenClaw `plugin-runtime-deps` bind-mount quirk (an `extra_bind_mounts` entry,
-  absent for Hermes).
-
-## Next step after this contract is agreed
-
-Build `modules/product_instance/` by moving `modules/openclaw/`'s logic in and
-replacing its hardcoded product values with `var.profile` lookups; add the two
-profiles; wire the gated `terraform.py` change; run the render-diff. Hermes then
-onboards as `profile=hermes` with the auth=`oidc` branch + per-instance Zitadel hook.
+1. This contract (done). 2. Gate harness. 3. Profile→scripts transport (refactor
+bundle scripts to source `/opt/<product>/profile.env`; verify byte-identical on
+OpenClaw; ship as a fleet bundle update). 4. `modules/product_instance` (move
+openclaw logic verbatim, preserve resource ADDRESSES + the `ignore_changes` block
++ force_detach/force_destroy + comment-strip + 5 outputs) + `profiles/openclaw.json`;
+gate suite green. 5. Orchestrator profile-gating (one commit-set) + submodule bump
++ handoff broker; verify OpenClaw (profile=NULL) unchanged in staging. 6. **Subagent
+CODE review**, then flip OpenClaw blueprint→product_instance+profile=openclaw
+(staging→prod) with destroy+upgrade verification. 7. Hermes prereqs (OIDC-free
+auth via the shared wall; HERMES_*_SCRIPTS_B64 bundles published BEFORE provision;
+rotate-equivalent). 8. Live-boot hermes arm64 once to confirm loopback dashboard
+reachability from host nginx. 9. `profiles/hermes.json` + greenfield staging
+blueprint + full E2E (buy→provision→click-Open handoff→env(reserved rejected)→
+upgrade→custom domain→destroy). 10. Production Hermes + verify prod==workspace +
+canonical repos; schedule deferred pre-existing-bug fixes (password_read_command
+vs token seed; login.html await bug).
