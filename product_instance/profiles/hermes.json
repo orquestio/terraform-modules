@@ -12,7 +12,7 @@
     "state_dir": "/var/lib/hermes",
     "scripts_dir": "/opt/hermes/scripts",
     "product_home": "/opt/hermes",
-    "ssm_bundle_params": "HERMES_SCRIPTS_B64 HERMES_BYO_SCRIPTS_B64",
+    "ssm_bundle_params": "HERMES_SCRIPTS_B64 HERMES_SEC_SCRIPTS_B64 HERMES_BYO_SCRIPTS_B64",
     "config_file": ".env",
     "seed_version": "2026.7.7",
     "env_gateway_password": "API_SERVER_KEY",
