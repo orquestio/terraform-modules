@@ -79,9 +79,16 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   const hash = await sha256(pwd);
   document.cookie = 'oc_session=' + hash + ';path=/;max-age=604800;SameSite=Lax';
   try {
-    const res = await fetch('/healthz');
+    // Validate the cookie against the wall. Hermes has no /healthz behind the
+    // wall (that path only exists in the OpenClaw profile), so probing it always
+    // 404'd and the manual login could never succeed. Instead probe '/': a valid
+    // cookie proxies through to the dashboard (200); an invalid one is redirected
+    // to /login by the wall (302). With redirect:'manual' that 302 surfaces as an
+    // opaque, non-ok response, so res.ok cleanly distinguishes right/wrong password.
+    const res = await fetch('/', { redirect: 'manual' });
     if (res.ok) {
-      window.location.href = '/?token=' + encodeURIComponent(pwd);
+      // Cookie-only auth — never put the password in the URL (referer/history leak).
+      window.location.href = '/';
     } else {
       err.style.display = 'block';
       document.cookie = 'oc_session=;path=/;max-age=0';
