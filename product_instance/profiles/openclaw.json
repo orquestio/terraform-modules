@@ -6,6 +6,18 @@
     "plugin_host": "/var/lib/openclaw/plugin-runtime-deps",
     "plugin_ctr": "/home/node/.openclaw/plugin-runtime-deps",
     "health_path": "/healthz",
-    "run_cmd": "node openclaw.mjs gateway --bind lan --port"
+    "run_cmd": "node openclaw.mjs gateway --bind lan --port",
+    "state_dir": "/var/lib/openclaw",
+    "scripts_dir": "/opt/openclaw/scripts",
+    "product_home": "/opt/openclaw",
+    "ssm_bundle_params": "OPENCLAW_SCRIPTS_B64 OPENCLAW_SEC_SCRIPTS_B64 OPENCLAW_BYO_SCRIPTS_B64 OPENCLAW_AI_SCRIPTS_B64",
+    "config_file": "openclaw.json",
+    "seed_version": "2026.4.10",
+    "env_gateway_password": "OPENCLAW_GATEWAY_PASSWORD",
+    "env_gateway_token": "OPENCLAW_GATEWAY_TOKEN",
+    "watchdog_name": "openclaw-watchdog",
+    "product_label": "OpenClaw",
+    "upstream_conf": "openclaw-upstream.conf",
+    "upstream_name": "openclaw_backend"
   }
 }

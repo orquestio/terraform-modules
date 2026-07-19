@@ -78,9 +78,9 @@ docker pull "${docker_image}"
 #      provisioning time; terraform seeds it via ${gateway_password}.
 #   2. AWS Secrets Manager → "orquestio/instances/<id>/gateway-password". Mirror
 #      maintained by user_data (bootstrap) and rotate_password.sh (rotations).
-#   3. /mnt/efs/config/container.env → OPENCLAW_GATEWAY_PASSWORD + OPENCLAW_GATEWAY_TOKEN
+#   3. /mnt/efs/config/container.env → ${env_gateway_password} + ${env_gateway_token}
 #      (both set to the same value; read at docker run via --env-file).
-#   4. openclaw.json → gateway.auth.token (must match OPENCLAW_GATEWAY_TOKEN env
+#   4. openclaw.json → gateway.auth.token (must match ${env_gateway_token} env
 #      var or OpenClaw auto-rotates on restart, breaking auth).
 #   5. /etc/nginx/conf.d/gateway-auth.conf → SHA-256(password) cookie map.
 # rotate_password.sh mutates 2-5 atomically (not 1 — that column only applies
@@ -103,9 +103,9 @@ fi
 GATEWAY_COOKIE_HASH=$(echo -n "$GATEWAY_PASSWORD" | sha256sum | cut -d' ' -f1)
 
 # --- 4b. Create openclaw.json with auth pinned to the bootstrap password ---
-if [ ! -f "$EFS_MOUNT/config/openclaw.json" ]; then
-  echo "[$(date)] Creating OpenClaw config (auth: token mode, cron-safe)..."
-  cat > "$EFS_MOUNT/config/openclaw.json" << OCCONFIG
+if [ ! -f "$EFS_MOUNT/config/${config_file}" ]; then
+  echo "[$(date)] Creating ${product_label} config (auth: token mode, cron-safe)..."
+  cat > "$EFS_MOUNT/config/${config_file}" << OCCONFIG
 {
   "gateway": {
     "mode": "local",
@@ -124,7 +124,7 @@ if [ ! -f "$EFS_MOUNT/config/openclaw.json" ]; then
   },
   "agents": {
     "defaults": {
-      "workspace": "/home/node/.openclaw/workspace"
+      "workspace": "${ctr_home}/workspace"
     }
   },
   "session": {
@@ -132,17 +132,17 @@ if [ ! -f "$EFS_MOUNT/config/openclaw.json" ]; then
   },
   "wizard": {
     "lastRunAt": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
-    "lastRunVersion": "2026.4.10",
+    "lastRunVersion": "${seed_version}",
     "lastRunCommand": "onboard",
     "lastRunMode": "local"
   },
   "meta": {
-    "lastTouchedVersion": "2026.4.10",
+    "lastTouchedVersion": "${seed_version}",
     "lastTouchedAt": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   }
 }
 OCCONFIG
-  chown 1000:1000 "$EFS_MOUNT/config/openclaw.json"
+  chown 1000:1000 "$EFS_MOUNT/config/${config_file}"
 fi
 
 # --- 5. Arrancar OpenClaw ---
@@ -162,18 +162,18 @@ if [ ! -f "$CONTAINER_ENV_FILE" ]; then
   chmod 600 "$CONTAINER_ENV_FILE"
   chown 1000:1000 "$CONTAINER_ENV_FILE"
 fi
-# Pin OPENCLAW_GATEWAY_PASSWORD + OPENCLAW_GATEWAY_TOKEN from the bootstrap
+# Pin ${env_gateway_password} + ${env_gateway_token} from the bootstrap
 # secret so every restart.sh recreate preserves the same value OpenClaw reads
 # from openclaw.json. apply_env_vars.sh never touches these names.
-# Both vars hold the same password — OPENCLAW_GATEWAY_PASSWORD is for our
-# nginx cookie wall, OPENCLAW_GATEWAY_TOKEN is what OpenClaw reads for
+# Both vars hold the same password — ${env_gateway_password} is for our
+# nginx cookie wall, ${env_gateway_token} is what OpenClaw reads for
 # token-mode auth + loopback/cron authentication.
 TMP_BOOTSTRAP_ENV=$(mktemp)
 if [ -s "$CONTAINER_ENV_FILE" ]; then
-  grep -v '^OPENCLAW_GATEWAY_PASSWORD=' "$CONTAINER_ENV_FILE" | grep -v '^OPENCLAW_GATEWAY_TOKEN=' > "$TMP_BOOTSTRAP_ENV" || true
+  grep -v '^${env_gateway_password}=' "$CONTAINER_ENV_FILE" | grep -v '^${env_gateway_token}=' > "$TMP_BOOTSTRAP_ENV" || true
 fi
-echo "OPENCLAW_GATEWAY_PASSWORD=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
-echo "OPENCLAW_GATEWAY_TOKEN=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
+echo "${env_gateway_password}=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
+echo "${env_gateway_token}=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
 mv "$TMP_BOOTSTRAP_ENV" "$CONTAINER_ENV_FILE"
 chmod 600 "$CONTAINER_ENV_FILE"
 chown 1000:1000 "$CONTAINER_ENV_FILE"
@@ -185,16 +185,16 @@ chown 1000:1000 "$CONTAINER_ENV_FILE"
 # container at 100% I/O wait. We bind-mount it to local SSD so the loop
 # is harmless on the box. The dir lives OUTSIDE EFS specifically so it's
 # wiped on instance replacement. See OPENCLAW_AUTH_AND_PROXY.md and the
-# pre_start_wipe.sh / openclaw-watchdog.service installed below.
-mkdir -p /var/lib/openclaw/plugin-runtime-deps
-chown -R 1000:1000 /var/lib/openclaw
+# pre_start_wipe.sh / ${watchdog_name}.service installed below.
+mkdir -p ${plugin_host}
+chown -R 1000:1000 ${state_dir}
 
-echo "[$(date)] Starting OpenClaw container"
+echo "[$(date)] Starting ${product_label} container"
 # Healthcheck strategy: we OVERRIDE the image's baked-in healthcheck with our
 # own --health-cmd below. The upstream check probes a path that on this image
 # can leave customer containers stuck in `starting` long past readiness. We
 # deliberately do NOT pass --no-healthcheck (which would disable Health.Status
-# entirely) because the openclaw-watchdog timer relies on `docker inspect`'s
+# entirely) because the ${watchdog_name} timer relies on `docker inspect`'s
 # Health.Status to detect a wedged container and trigger a recreate. Keeping
 # our own --health-cmd gives us both: a working /healthz probe AND a signal
 # the watchdog can act on. (Substring `--no-healthcheck` retained intentionally
@@ -236,18 +236,18 @@ docker run -d \
 #   - OPENCLAW_BYO_SCRIPTS_B64  → add_custom_domain, remove_custom_domain, login.html
 #   - OPENCLAW_AI_SCRIPTS_B64   → configure_ai_models
 # Los tres se extraen al mismo dir /opt/openclaw/scripts/.
-mkdir -p /opt/openclaw/scripts /opt/openclaw
-echo "${instance_id}" > /opt/openclaw/instance_id
-chmod 644 /opt/openclaw/instance_id
+mkdir -p ${scripts_dir} ${product_home}
+echo "${instance_id}" > ${product_home}/instance_id
+chmod 644 ${product_home}/instance_id
 
-for param in OPENCLAW_SCRIPTS_B64 OPENCLAW_SEC_SCRIPTS_B64 OPENCLAW_BYO_SCRIPTS_B64 OPENCLAW_AI_SCRIPTS_B64; do
+for param in ${ssm_bundle_params}; do
   BUNDLE_OK=false
   for attempt in 1 2 3; do
     TMP_BUNDLE=$(mktemp)
     if aws ssm get-parameter --name "/orquestio/prod/$param" \
          --with-decryption --region ${aws_region} \
          --query "Parameter.Value" --output text > "$TMP_BUNDLE" 2>/dev/null; then
-      if base64 -d "$TMP_BUNDLE" | tar -xzf - -C /opt/openclaw/scripts/ 2>/dev/null; then
+      if base64 -d "$TMP_BUNDLE" | tar -xzf - -C ${scripts_dir}/ 2>/dev/null; then
         BUNDLE_OK=true
         rm -f "$TMP_BUNDLE"
         break
@@ -261,8 +261,8 @@ for param in OPENCLAW_SCRIPTS_B64 OPENCLAW_SEC_SCRIPTS_B64 OPENCLAW_BYO_SCRIPTS_
     echo "[$(date)] CRITICAL: $param failed after 3 attempts"
   fi
 done
-chmod +x /opt/openclaw/scripts/*.sh 2>/dev/null || true
-echo "[$(date)] control plane scripts installed: $(ls /opt/openclaw/scripts/)"
+chmod +x ${scripts_dir}/*.sh 2>/dev/null || true
+echo "[$(date)] control plane scripts installed: $(ls ${scripts_dir}/)"
 
 # --- 6. CloudWatch Agent ---
 echo "[$(date)] Starting CloudWatch Agent"
@@ -294,8 +294,8 @@ COOKIE_VALUE="$GATEWAY_COOKIE_HASH"
 # Login page con branding Orquestio — extraído del tar.gz a /opt/openclaw/scripts/login.html
 # Si el bundle download falló, create a minimal fallback login page.
 mkdir -p /etc/nginx/html
-if [ -f /opt/openclaw/scripts/login.html ]; then
-  cp /opt/openclaw/scripts/login.html /etc/nginx/html/login.html
+if [ -f ${scripts_dir}/login.html ]; then
+  cp ${scripts_dir}/login.html /etc/nginx/html/login.html
 else
   echo "[$(date)] WARNING: login.html not found in scripts, using minimal fallback"
   cat > /etc/nginx/html/login.html << 'FALLBACK_LOGIN'
@@ -316,9 +316,9 @@ fi
 # replacement para apuntar al container nuevo sin tocar el resto de la config
 # de nginx. Sprint 2.2 depende de que viva en conf.d/ como archivo separado.
 mkdir -p /etc/nginx/conf.d
-cat > /etc/nginx/conf.d/openclaw-upstream.conf << UPSTREAMCONF
+cat > /etc/nginx/conf.d/${upstream_conf} << UPSTREAMCONF
 # Managed by /opt/openclaw/scripts/upgrade.sh — do not edit by hand.
-upstream openclaw_backend {
+upstream ${upstream_name} {
     server 127.0.0.1:${container_port};
 }
 UPSTREAMCONF
@@ -329,7 +329,7 @@ UPSTREAMCONF
 # include /etc/nginx/conf.d/*.conf en nginx.conf).
 cat > /etc/nginx/conf.d/gateway-auth.conf << GWAUTHCONF
 # Managed by /opt/openclaw/scripts/rotate_password.sh — do not edit by hand.
-# Cookie oc_session value = SHA-256(OPENCLAW_GATEWAY_PASSWORD).
+# Cookie oc_session value = SHA-256(${env_gateway_password}).
 map \$cookie_oc_session \$auth_ok {
     "$COOKIE_VALUE" "yes";
     default "no";
@@ -349,7 +349,7 @@ map \$cookie_oc_session \$oc_token {
 }
 GWAUTHCONF
 
-# Nginx config principal — el server block apunta al upstream openclaw_backend
+# Nginx config principal — el server block apunta al upstream ${upstream_name}
 # definido en /etc/nginx/conf.d/openclaw-upstream.conf. Cargamos TODOS los
 # archivos de conf.d/*.conf con wildcard para que add_custom_domain.sh pueda
 # inyectar nuevos server blocks (custom-domain-*.conf) sin tocar nginx.conf.
@@ -400,7 +400,7 @@ http {
             if (\$auth_ok = "no") {
                 return 401 '{"error":"unauthorized"}';
             }
-            proxy_pass http://openclaw_backend/healthz;
+            proxy_pass http://${upstream_name}/healthz;
             proxy_set_header Authorization \$gateway_token_header;
         }
 
@@ -425,7 +425,7 @@ http {
             if (\$do_redirect = "yes") {
                 rewrite ^ "/?token=\$oc_token" redirect;
             }
-            proxy_pass http://openclaw_backend/;
+            proxy_pass http://${upstream_name}/;
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection "upgrade";
@@ -443,7 +443,7 @@ http {
             if (\$auth_ok = "no") {
                 return 302 /login;
             }
-            proxy_pass http://openclaw_backend;
+            proxy_pass http://${upstream_name};
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection "upgrade";
@@ -482,7 +482,7 @@ fi
 
 # --- 8. Cleanup of legacy watchdog timer (eliminado 2026-05-08) ---
 # Versiones previas de este user_data instalaban un systemd timer
-# (openclaw-watchdog.timer) que cada 60s revisaba `docker inspect --format
+# (${watchdog_name}.timer) que cada 60s revisaba `docker inspect --format
 # '{{.State.Health.Status}}'` y si detectaba "unhealthy" 3 veces seguidas
 # llamaba a pre_start_wipe.sh + restart.sh para recrear el contenedor. Se
 # eliminó por dos razones, ambas observadas en la instancia bakvl1
@@ -509,12 +509,12 @@ fi
 #
 # Si una instancia ya tiene el watchdog instalado de un user_data viejo, lo
 # desactivamos defensivamente acá. Es idempotente — fallos se ignoran.
-systemctl disable --now openclaw-watchdog.timer 2>/dev/null || true
-systemctl disable --now openclaw-watchdog.service 2>/dev/null || true
-rm -f /etc/systemd/system/openclaw-watchdog.timer
-rm -f /etc/systemd/system/openclaw-watchdog.service
-rm -f /usr/local/bin/openclaw-watchdog.sh
-rm -f /var/lib/openclaw/watchdog.state /var/lib/openclaw/.watchdog_state
+systemctl disable --now ${watchdog_name}.timer 2>/dev/null || true
+systemctl disable --now ${watchdog_name}.service 2>/dev/null || true
+rm -f /etc/systemd/system/${watchdog_name}.timer
+rm -f /etc/systemd/system/${watchdog_name}.service
+rm -f /usr/local/bin/${watchdog_name}.sh
+rm -f ${state_dir}/watchdog.state ${state_dir}/.watchdog_state
 systemctl daemon-reload 2>/dev/null || true
 
 echo "[$(date)] Bootstrap complete. Instance ready."
