@@ -1,6 +1,8 @@
 {
   "key": "openclaw",
   "template_vars": {
+    "product_key": "openclaw",
+    "health_port": "18789",
     "container_name": "openclaw-current",
     "ctr_home": "/home/node/.openclaw",
     "plugin_host": "/var/lib/openclaw/plugin-runtime-deps",

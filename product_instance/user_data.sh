@@ -103,6 +103,10 @@ fi
 GATEWAY_COOKIE_HASH=$(echo -n "$GATEWAY_PASSWORD" | sha256sum | cut -d' ' -f1)
 
 # --- 4b. Create openclaw.json with auth pinned to the bootstrap password ---
+# Profile-branched: OpenClaw seeds openclaw.json on the host; Hermes self-seeds
+# config.yaml inside the container on first boot (HERMES_HOME=/opt/data, mounted
+# from the data volume), so no host-side config seed is needed here.
+%{ if product_key == "openclaw" ~}
 if [ ! -f "$EFS_MOUNT/config/${config_file}" ]; then
   echo "[$(date)] Creating ${product_label} config (auth: token mode, cron-safe)..."
   cat > "$EFS_MOUNT/config/${config_file}" << OCCONFIG
@@ -147,6 +151,7 @@ if [ ! -f "$EFS_MOUNT/config/${config_file}" ]; then
 OCCONFIG
   chown 1000:1000 "$EFS_MOUNT/config/${config_file}"
 fi
+%{ endif ~}
 
 # --- 5. Arrancar OpenClaw ---
 # Container name is "openclaw-current" so that upgrade.sh (Fase 4 Sprint 2.2)
@@ -172,11 +177,34 @@ fi
 # nginx cookie wall, ${env_gateway_token} is what OpenClaw reads for
 # token-mode auth + loopback/cron authentication.
 TMP_BOOTSTRAP_ENV=$(mktemp)
+%{ if product_key == "openclaw" ~}
 if [ -s "$CONTAINER_ENV_FILE" ]; then
   grep -v '^${env_gateway_password}=' "$CONTAINER_ENV_FILE" | grep -v '^${env_gateway_token}=' > "$TMP_BOOTSTRAP_ENV" || true
 fi
 echo "${env_gateway_password}=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
 echo "${env_gateway_token}=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
+%{ endif ~}
+%{ if product_key == "hermes" ~}
+# Hermes: no native login — the shared nginx cookie wall is the only gate. The
+# dashboard (:${container_port}) binds to loopback (HERMES_DASHBOARD_HOST=127.0.0.1)
+# so it is never exposed; the health API (:${health_port}, /health) needs
+# API_SERVER_ENABLED + a >=16-char key. With host networking (see docker run)
+# 127.0.0.1/0.0.0.0 binds on the host so the wall reaches them on localhost.
+if [ -s "$CONTAINER_ENV_FILE" ]; then
+  grep -vE '^(API_SERVER_ENABLED|API_SERVER_HOST|API_SERVER_PORT|API_SERVER_KEY|HERMES_DASHBOARD|HERMES_DASHBOARD_HOST|HERMES_DASHBOARD_PORT|PUID|PGID)=' "$CONTAINER_ENV_FILE" > "$TMP_BOOTSTRAP_ENV" || true
+fi
+{
+  echo "HERMES_DASHBOARD=1"
+  echo "HERMES_DASHBOARD_HOST=127.0.0.1"
+  echo "HERMES_DASHBOARD_PORT=${container_port}"
+  echo "API_SERVER_ENABLED=true"
+  echo "API_SERVER_HOST=0.0.0.0"
+  echo "API_SERVER_PORT=${health_port}"
+  echo "API_SERVER_KEY=$GATEWAY_PASSWORD"
+  echo "PUID=1000"
+  echo "PGID=1000"
+} >> "$TMP_BOOTSTRAP_ENV"
+%{ endif ~}
 mv "$TMP_BOOTSTRAP_ENV" "$CONTAINER_ENV_FILE"
 chmod 600 "$CONTAINER_ENV_FILE"
 chown 1000:1000 "$CONTAINER_ENV_FILE"
