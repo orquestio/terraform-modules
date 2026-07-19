@@ -278,6 +278,16 @@ docker run -d \
   --health-start-period 1200s \
   "${docker_image}" \
   ${run_cmd}
+
+# Harden IMDS (defense-in-depth with the IMDSv2-required metadata_options in
+# main.tf). With host networking the container shares the instance network
+# namespace; block non-root processes (the Hermes agent drops to PUID 1000) from
+# reaching the metadata endpoint so a compromised / prompt-injected agent cannot
+# steal the instance IAM role. Host agents (SSM, CloudWatch, cloud-init) run as
+# root and keep IMDS access. Idempotent (-C guard before -A).
+dnf install -y -q iptables 2>/dev/null || true
+iptables -C OUTPUT -d 169.254.169.254/32 -m owner ! --uid-owner 0 -j DROP 2>/dev/null \
+  || iptables -A OUTPUT -d 169.254.169.254/32 -m owner ! --uid-owner 0 -j DROP
 %{ endif ~}
 # NOTE: entry point changed from `dist/index.js` to `openclaw.mjs` in upstream
 # v2026.4.9 (Docker CMD refactor). Older images (≤v2026.4.8) still use

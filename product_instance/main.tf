@@ -98,6 +98,23 @@ resource "aws_instance" "client" {
     volume_type = "gp3"
   }
 
+  # IMDS hardening — Hermes only. Hermes runs with host networking (its dashboard
+  # binds to loopback and a bridge cannot reach it; see user_data.sh), so the
+  # container shares the instance network namespace and could otherwise read IMDS
+  # to steal the instance IAM role. Require IMDSv2 (a token PUT) and hop-limit 1
+  # so a naive SSRF from the AI agent (a GET with no token) cannot obtain
+  # credentials; user_data additionally iptables-blocks non-root → IMDS. OpenClaw
+  # is bridge-isolated and keeps the AWS default (no block rendered here) so the
+  # engine flip stays plan-zero.
+  dynamic "metadata_options" {
+    for_each = local.profile.key == "hermes" ? [1] : []
+    content {
+      http_endpoint               = "enabled"
+      http_tokens                 = "required"
+      http_put_response_hop_limit = 1
+    }
+  }
+
   # user_data.sh fetches upgrade.sh from SSM Parameter Store at boot
   # (/orquestio/prod/OPENCLAW_UPGRADE_SCRIPT_B64, gzip+base64 encoded).
   # Inline embedding was abandoned in Sprint 2.2 retry because the EC2
