@@ -1,0 +1,11 @@
+{
+  "key": "openclaw",
+  "template_vars": {
+    "container_name": "openclaw-current",
+    "ctr_home": "/home/node/.openclaw",
+    "plugin_host": "/var/lib/openclaw/plugin-runtime-deps",
+    "plugin_ctr": "/home/node/.openclaw/plugin-runtime-deps",
+    "health_path": "/healthz",
+    "run_cmd": "node openclaw.mjs gateway --bind lan --port"
+  }
+}
