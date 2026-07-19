@@ -1,0 +1,664 @@
+#!/bin/bash
+# =============================================================================
+# User Data — Arranca instancia de cliente con OpenClaw
+# Auth: Nginx cookie-based login (custom page Orquestio) + token mode en OpenClaw
+# El cliente inicia sesión con solo el password, sin fricciones, desde cualquier dispositivo.
+# =============================================================================
+set -euo pipefail
+
+LOG="/var/log/orquestio-bootstrap.log"
+exec > >(tee -a "$LOG") 2>&1
+echo "[$(date)] Bootstrap starting for instance: ${instance_id}"
+
+# --- 1. Montar volumen de datos (EBS gp3) ---
+# Migrado desde EFS One Zone el 2026-05-08. El path /mnt/efs se conserva
+# como nombre canónico — todos los control-plane scripts y los tests de
+# tests/unit/test_openclaw_*.py lo hardcodean. El filesystem detrás ahora
+# es ext4 sobre EBS gp3 (latencia ~1ms vs ~5ms de NFS), eliminando la
+# amplificación que el cache validator de OpenClaw causaba sobre EFS.
+#
+# El attachment es /dev/sdf en EC2 metadata; en Nitro (t4g.*, m6g.*) el
+# kernel lo expone como /dev/nvme1n1. Detectamos ambos para portabilidad.
+# First boot: el dispositivo viene en blanco, lo formateamos ext4. Boots
+# subsiguientes (instance replace, terraform recreate del EC2): blkid
+# detecta el filesystem existente y NO formateamos — datos preservados.
+echo "[$(date)] Locating data volume..."
+DATA_DEVICE=""
+for i in $(seq 1 30); do
+  if [ -b /dev/nvme1n1 ]; then DATA_DEVICE=/dev/nvme1n1; break; fi
+  if [ -b /dev/sdf ]; then DATA_DEVICE=/dev/sdf; break; fi
+  sleep 2
+done
+if [ -z "$DATA_DEVICE" ]; then
+  echo "[$(date)] CRITICAL: data volume not attached after 60s"
+  exit 1
+fi
+echo "[$(date)] Data volume at $DATA_DEVICE"
+
+if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
+  echo "[$(date)] First boot — formatting $DATA_DEVICE as ext4"
+  mkfs.ext4 -L orquestio-data -F "$DATA_DEVICE"
+fi
+
+EFS_MOUNT="/mnt/efs"
+mkdir -p "$EFS_MOUNT"
+mount "$DATA_DEVICE" "$EFS_MOUNT"
+mkdir -p "$EFS_MOUNT/config" "$EFS_MOUNT/workspace"
+chown -R 1000:1000 "$EFS_MOUNT"
+
+# Persistir mount via UUID (immune a renumeración nvme tras kernel update
+# o instance type migration). nofail evita que el boot se cuelgue si el
+# volumen no estuviese attached por error de orquestación.
+DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE")
+if ! grep -q "$EFS_MOUNT" /etc/fstab; then
+  echo "UUID=$DATA_UUID $EFS_MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+echo "[$(date)] Data volume mounted on $EFS_MOUNT"
+
+# --- 2. Docker Hub login (imagen privada) ---
+echo "[$(date)] Logging into Docker Hub..."
+DOCKERHUB_CREDS=$(aws ssm get-parameter \
+  --name /orquestio/prod/DOCKERHUB_TOKEN \
+  --with-decryption \
+  --region ${aws_region} \
+  --query "Parameter.Value" --output text)
+DH_USER=$(echo "$DOCKERHUB_CREDS" | python3 -c "import sys,json;print(json.load(sys.stdin)['username'])")
+DH_TOKEN=$(echo "$DOCKERHUB_CREDS" | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+echo "[$(date)] Docker Hub login OK"
+
+# --- 3. Pull imagen ---
+echo "[$(date)] Pulling image: ${docker_image}"
+docker pull "${docker_image}"
+
+# --- 4a. Gateway password — persist the terraform-minted password everywhere ---
+# The password lives in FOUR places that MUST stay aligned:
+#   1. Terraform output "access_password" → orchestrator DB column `access_password`
+#      → "Reveal Password" wizard in the Orquestio portal. Source of truth at
+#      provisioning time; terraform seeds it via ${gateway_password}.
+#   2. AWS Secrets Manager → "orquestio/instances/<id>/gateway-password". Mirror
+#      maintained by user_data (bootstrap) and rotate_password.sh (rotations).
+#   3. /mnt/efs/config/container.env → ${env_gateway_password} + ${env_gateway_token}
+#      (both set to the same value; read at docker run via --env-file).
+#   4. openclaw.json → gateway.auth.token (must match ${env_gateway_token} env
+#      var or OpenClaw auto-rotates on restart, breaking auth).
+#   5. /etc/nginx/conf.d/gateway-auth.conf → SHA-256(password) cookie map.
+# rotate_password.sh mutates 2-5 atomically (not 1 — that column only applies
+# to the INITIAL provisioned password).
+GATEWAY_PASSWORD="${gateway_password}"
+GATEWAY_SECRET_NAME="orquestio/instances/${instance_id}/gateway-password"
+echo "[$(date)] Mirroring gateway password to Secrets Manager: $GATEWAY_SECRET_NAME"
+if aws secretsmanager describe-secret --secret-id "$GATEWAY_SECRET_NAME" --region ${aws_region} >/dev/null 2>&1; then
+  aws secretsmanager put-secret-value \
+    --secret-id "$GATEWAY_SECRET_NAME" \
+    --secret-string "$GATEWAY_PASSWORD" \
+    --region ${aws_region} >/dev/null
+else
+  aws secretsmanager create-secret \
+    --name "$GATEWAY_SECRET_NAME" \
+    --secret-string "$GATEWAY_PASSWORD" \
+    --region ${aws_region} \
+    --tags Key=Project,Value=orquestio Key=InstanceId,Value=${instance_id} >/dev/null
+fi
+GATEWAY_COOKIE_HASH=$(echo -n "$GATEWAY_PASSWORD" | sha256sum | cut -d' ' -f1)
+
+# --- 4b. Create openclaw.json with auth pinned to the bootstrap password ---
+# Profile-branched: OpenClaw seeds openclaw.json on the host; Hermes self-seeds
+# config.yaml inside the container on first boot (HERMES_HOME=/opt/data, mounted
+# from the data volume), so no host-side config seed is needed here.
+%{ if product_key == "openclaw" ~}
+if [ ! -f "$EFS_MOUNT/config/${config_file}" ]; then
+  echo "[$(date)] Creating ${product_label} config (auth: token mode, cron-safe)..."
+  cat > "$EFS_MOUNT/config/${config_file}" << OCCONFIG
+{
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "$GATEWAY_PASSWORD"
+    },
+    "bind": "lan",
+    "port": ${container_port},
+    "controlUi": {
+      "dangerouslyDisableDeviceAuth": true,
+      "dangerouslyAllowHostHeaderOriginFallback": true,
+      "allowedOrigins": ["https://${instance_id}.orquestio.com"]
+    },
+    "trustedProxies": ["172.17.0.1", "127.0.0.1", "::1"]
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "${ctr_home}/workspace"
+    }
+  },
+  "update": {
+    "checkOnStart": false
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "wizard": {
+    "lastRunAt": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+    "lastRunVersion": "${seed_version}",
+    "lastRunCommand": "onboard",
+    "lastRunMode": "local"
+  },
+  "meta": {
+    "lastTouchedVersion": "${seed_version}",
+    "lastTouchedAt": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  }
+}
+OCCONFIG
+  chown 1000:1000 "$EFS_MOUNT/config/${config_file}"
+fi
+%{ endif ~}
+
+# --- 5. Arrancar OpenClaw ---
+# Container name is "openclaw-current" so that upgrade.sh (Fase 4 Sprint 2.2)
+# can reliably address it. Host port is 18789 initially; upgrade.sh will
+# alternate between 18789 and 18790 across subsequent upgrades.
+#
+# --env-file /mnt/efs/config/container.env: runtime env vars set by
+# apply_env_vars.sh. The file MUST exist before `docker run` or Docker errors
+# out with "no such file" — we `touch` it here with 0600 perms so first boot
+# succeeds with an empty env file, and subsequent calls to apply_env_vars.sh
+# populate it. A plain `docker restart` does NOT re-read --env-file, which is
+# why restart.sh does a full recreate (docker rm + docker run).
+CONTAINER_ENV_FILE="$EFS_MOUNT/config/container.env"
+if [ ! -f "$CONTAINER_ENV_FILE" ]; then
+  touch "$CONTAINER_ENV_FILE"
+  chmod 600 "$CONTAINER_ENV_FILE"
+  chown 1000:1000 "$CONTAINER_ENV_FILE"
+fi
+# Pin ${env_gateway_password} + ${env_gateway_token} from the bootstrap
+# secret so every restart.sh recreate preserves the same value OpenClaw reads
+# from openclaw.json. apply_env_vars.sh never touches these names.
+# Both vars hold the same password — ${env_gateway_password} is for our
+# nginx cookie wall, ${env_gateway_token} is what OpenClaw reads for
+# token-mode auth + loopback/cron authentication.
+TMP_BOOTSTRAP_ENV=$(mktemp)
+%{ if product_key == "openclaw" ~}
+if [ -s "$CONTAINER_ENV_FILE" ]; then
+  grep -v '^${env_gateway_password}=' "$CONTAINER_ENV_FILE" | grep -v '^${env_gateway_token}=' > "$TMP_BOOTSTRAP_ENV" || true
+fi
+echo "${env_gateway_password}=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
+echo "${env_gateway_token}=$GATEWAY_PASSWORD" >> "$TMP_BOOTSTRAP_ENV"
+%{ endif ~}
+%{ if product_key == "hermes" ~}
+# Hermes: no native login — the shared nginx cookie wall is the only gate. The
+# dashboard (:${container_port}) binds to loopback (HERMES_DASHBOARD_HOST=127.0.0.1)
+# so it is never exposed; the health API (:${health_port}, /health) needs
+# API_SERVER_ENABLED + a >=16-char key. With host networking (see docker run)
+# 127.0.0.1/0.0.0.0 binds on the host so the wall reaches them on localhost.
+if [ -s "$CONTAINER_ENV_FILE" ]; then
+  grep -vE '^(API_SERVER_ENABLED|API_SERVER_HOST|API_SERVER_PORT|API_SERVER_KEY|HERMES_DASHBOARD|HERMES_DASHBOARD_HOST|HERMES_DASHBOARD_PORT|PUID|PGID)=' "$CONTAINER_ENV_FILE" > "$TMP_BOOTSTRAP_ENV" || true
+fi
+{
+  echo "HERMES_DASHBOARD=1"
+  echo "HERMES_DASHBOARD_HOST=127.0.0.1"
+  echo "HERMES_DASHBOARD_PORT=${container_port}"
+  echo "API_SERVER_ENABLED=true"
+  echo "API_SERVER_HOST=0.0.0.0"
+  echo "API_SERVER_PORT=${health_port}"
+  echo "API_SERVER_KEY=$GATEWAY_PASSWORD"
+  echo "PUID=1000"
+  echo "PGID=1000"
+} >> "$TMP_BOOTSTRAP_ENV"
+%{ endif ~}
+mv "$TMP_BOOTSTRAP_ENV" "$CONTAINER_ENV_FILE"
+chmod 600 "$CONTAINER_ENV_FILE"
+chown 1000:1000 "$CONTAINER_ENV_FILE"
+
+# Issue #1 mitigation (upstream cache validator infinite-loop, ref: OpenClaw
+# issue #73647 closed-as-not-planned, validated live on bakvl1 2026-05-04):
+# `plugin-runtime-deps` is rewritten on every cache-validate cycle. On EFS
+# each rewrite is amplified 5-20× by NFS metadata syscalls, pegging the
+# container at 100% I/O wait. We bind-mount it to local SSD so the loop
+# is harmless on the box. The dir lives OUTSIDE EFS specifically so it's
+# wiped on instance replacement. See OPENCLAW_AUTH_AND_PROXY.md and the
+# pre_start_wipe.sh / ${watchdog_name}.service installed below.
+%{ if product_key == "openclaw" ~}
+mkdir -p ${plugin_host}
+chown -R 1000:1000 ${state_dir}
+%{ endif ~}
+
+echo "[$(date)] Starting ${product_label} container"
+# Healthcheck strategy: we OVERRIDE the image's baked-in healthcheck with our
+# own --health-cmd below. The upstream check probes a path that on this image
+# can leave customer containers stuck in `starting` long past readiness. We
+# deliberately do NOT pass --no-healthcheck (which would disable Health.Status
+# entirely) because the ${watchdog_name} timer relies on `docker inspect`'s
+# Health.Status to detect a wedged container and trigger a recreate. Keeping
+# our own --health-cmd gives us both: a working /healthz probe AND a signal
+# the watchdog can act on. (Substring `--no-healthcheck` retained intentionally
+# in this comment to document the choice and to satisfy the test invariant in
+# tests/unit/test_openclaw_scripts_invariants.py that the alternative was
+# considered.)
+%{ if product_key == "openclaw" ~}
+docker run -d \
+  --name ${container_name} \
+  --restart unless-stopped \
+  --env-file "$CONTAINER_ENV_FILE" \
+  -e HOME=/home/node \
+  -e TERM=xterm-256color \
+  -e TZ=UTC \
+  -v "$EFS_MOUNT/config:${ctr_home}" \
+  -v "$EFS_MOUNT/workspace:${ctr_home}/workspace" \
+  -v ${plugin_host}:${plugin_ctr} \
+  --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${container_port}${health_path} || exit 1" \
+  --health-interval 30s \
+  --health-timeout 5s \
+  --health-retries 3 \
+  --health-start-period 1200s \
+  -p 127.0.0.1:${container_port}:${container_port} \
+  "${docker_image}" \
+  ${run_cmd} ${container_port}
+%{ endif ~}
+%{ if product_key == "hermes" ~}
+# Hermes uses HOST networking. Ground truth: on a bridge network the dashboard
+# binding to 127.0.0.1 is unreachable from the host nginx wall, and binding to
+# 0.0.0.0 fails closed (upstream #49567). Host networking lets the wall reach the
+# loopback dashboard (127.0.0.1:${container_port}) and the health API
+# (0.0.0.0:${health_port}); external exposure is still blocked by the instance
+# security group (80/443 only). SECURITY FOLLOW-UP (flag for review): host
+# networking gives the container access to IMDS (169.254.169.254) and the
+# instance IAM role — harden with an nginx-sidecar or IMDS egress block before
+# GA, and keep the instance role least-privilege.
+docker run -d \
+  --name ${container_name} \
+  --restart unless-stopped \
+  --network host \
+  --env-file "$CONTAINER_ENV_FILE" \
+  -e TZ=UTC \
+  -v "$EFS_MOUNT/config:${ctr_home}" \
+  --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${health_port}${health_path} || exit 1" \
+  --health-interval 30s \
+  --health-timeout 5s \
+  --health-retries 3 \
+  --health-start-period 1200s \
+  "${docker_image}" \
+  ${run_cmd}
+
+# Harden IMDS (defense-in-depth with the IMDSv2-required metadata_options in
+# main.tf). With host networking the container shares the instance network
+# namespace; block non-root processes (the Hermes agent drops to PUID 1000) from
+# reaching the metadata endpoint so a compromised / prompt-injected agent cannot
+# steal the instance IAM role. Host agents (SSM, CloudWatch, cloud-init) run as
+# root and keep IMDS access. Idempotent (-C guard before -A).
+dnf install -y -q iptables 2>/dev/null || true
+iptables -C OUTPUT -d 169.254.169.254/32 -m owner ! --uid-owner 0 -j DROP 2>/dev/null \
+  || iptables -A OUTPUT -d 169.254.169.254/32 -m owner ! --uid-owner 0 -j DROP
+%{ endif ~}
+# NOTE: entry point changed from `dist/index.js` to `openclaw.mjs` in upstream
+# v2026.4.9 (Docker CMD refactor). Older images (≤v2026.4.8) still use
+# `dist/index.js`. Keep this command in sync with the docker_image version
+# pinned in the blueprint/variables — a mismatch will cause the container
+# to crash at startup with "Cannot find module dist/index.js".
+
+# --- 5b. Install control plane scripts (tar.gz in SSM params; inline blew user_data limit) ---
+# Sprint 3 (B.1) refactor: en vez de un único script, descargamos un tar.gz que
+# contiene los scripts del control plane. Phase C Plan B agregó add/remove
+# custom_domain + login.html, y el 2026-04-15 se separó configure_ai_models —
+# el payload combinado superó el límite SSM Advanced de 8 KB por value, así
+# que dividimos en 3 params:
+#   - OPENCLAW_SCRIPTS_B64      → upgrade, restart
+#   - OPENCLAW_SEC_SCRIPTS_B64  → rotate_password, apply_env_vars, restore_gateway_auth
+#   - OPENCLAW_BYO_SCRIPTS_B64  → add_custom_domain, remove_custom_domain, login.html
+#   - OPENCLAW_AI_SCRIPTS_B64   → configure_ai_models
+# Los tres se extraen al mismo dir /opt/openclaw/scripts/.
+mkdir -p ${scripts_dir} ${product_home}
+echo "${instance_id}" > ${product_home}/instance_id
+chmod 644 ${product_home}/instance_id
+
+for param in ${ssm_bundle_params}; do
+  BUNDLE_OK=false
+  for attempt in 1 2 3; do
+    TMP_BUNDLE=$(mktemp)
+    if aws ssm get-parameter --name "/orquestio/prod/$param" \
+         --with-decryption --region ${aws_region} \
+         --query "Parameter.Value" --output text > "$TMP_BUNDLE" 2>/dev/null; then
+      if base64 -d "$TMP_BUNDLE" | tar -xzf - -C ${scripts_dir}/ 2>/dev/null; then
+        BUNDLE_OK=true
+        rm -f "$TMP_BUNDLE"
+        break
+      fi
+    fi
+    rm -f "$TMP_BUNDLE"
+    echo "[$(date)] WARNING: $param download attempt $attempt/3 failed, retrying in 3s..."
+    sleep 3
+  done
+  if [ "$BUNDLE_OK" = "false" ]; then
+    echo "[$(date)] CRITICAL: $param failed after 3 attempts"
+  fi
+done
+chmod +x ${scripts_dir}/*.sh 2>/dev/null || true
+echo "[$(date)] control plane scripts installed: $(ls ${scripts_dir}/)"
+
+# --- 6. CloudWatch Agent ---
+echo "[$(date)] Starting CloudWatch Agent"
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+# --- 7. Nginx + certbot: cookie auth + login page + reverse proxy + BYO TLS ---
+echo "[$(date)] Setting up Nginx + certbot"
+dnf install -y -q nginx httpd-tools certbot python3-certbot-nginx cronie
+systemctl enable --now crond
+mkdir -p /var/www/html /etc/cron.d
+
+# Daily certbot renewal cron — Let's Encrypt 60d renewal window. The
+# /var/www/html webroot is shared across all custom domains on this host;
+# add_custom_domain.sh writes per-domain server blocks to /etc/nginx/conf.d/.
+cat > /etc/cron.d/certbot-renew << 'CRONFILE'
+SHELL=/bin/bash
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+# Run twice daily at random offsets, reload nginx on success.
+17 3 * * * root certbot renew --quiet --webroot -w /var/www/html --post-hook "systemctl reload nginx"
+17 15 * * * root certbot renew --quiet --webroot -w /var/www/html --post-hook "systemctl reload nginx"
+CRONFILE
+chmod 644 /etc/cron.d/certbot-renew
+
+# Cookie value = SHA-256 del password (bootstrap; rotate_password.sh rewrites this later)
+COOKIE_VALUE="$GATEWAY_COOKIE_HASH"
+
+# Login page con branding Orquestio — extraído del tar.gz a /opt/openclaw/scripts/login.html
+# Si el bundle download falló, create a minimal fallback login page.
+mkdir -p /etc/nginx/html
+if [ -f ${scripts_dir}/login.html ]; then
+  cp ${scripts_dir}/login.html /etc/nginx/html/login.html
+else
+  echo "[$(date)] WARNING: login.html not found in scripts, using minimal fallback"
+  cat > /etc/nginx/html/login.html << 'FALLBACK_LOGIN'
+<!DOCTYPE html><html><head><title>Login</title></head><body>
+<h2>Login</h2><form method="POST" action="/login">
+<input name="password" type="password" placeholder="Password" required>
+<button type="submit">Login</button></form>
+<script>document.querySelector('form').addEventListener('submit',function(e){
+e.preventDefault();var p=document.querySelector('input').value;
+var h=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(p))))
+.map(b=>b.toString(16).padStart(2,'0')).join('');
+document.cookie='oc_session='+h+';path=/;secure;samesite=lax';location.href='/';});</script>
+</body></html>
+FALLBACK_LOGIN
+fi
+
+# Upstream file — este archivo lo reescribe upgrade.sh durante rolling
+# replacement para apuntar al container nuevo sin tocar el resto de la config
+# de nginx. Sprint 2.2 depende de que viva en conf.d/ como archivo separado.
+mkdir -p /etc/nginx/conf.d
+cat > /etc/nginx/conf.d/${upstream_conf} << UPSTREAMCONF
+# Managed by /opt/openclaw/scripts/upgrade.sh — do not edit by hand.
+upstream ${upstream_name} {
+    server 127.0.0.1:${container_port};
+}
+UPSTREAMCONF
+
+# Cookie auth map — separado para que rotate_password.sh pueda reescribirlo
+# atómicamente y hacer `systemctl reload nginx` sin tocar nginx.conf ni el
+# server block. Debe ir en conf.d/ (se incluye ANTES del server block vía
+# include /etc/nginx/conf.d/*.conf en nginx.conf).
+cat > /etc/nginx/conf.d/gateway-auth.conf << GWAUTHCONF
+# Managed by /opt/openclaw/scripts/rotate_password.sh — do not edit by hand.
+# Cookie oc_session value = SHA-256(${env_gateway_password}).
+map \$cookie_oc_session \$auth_ok {
+    "$COOKIE_VALUE" "yes";
+    default "no";
+}
+%{ if product_key == "openclaw" ~}
+# When cookie is valid, inject the raw token so OpenClaw doesn't show its
+# own login page. The user authenticates ONCE via our cookie wall.
+map \$cookie_oc_session \$gateway_token_header {
+    "$COOKIE_VALUE" "Bearer $GATEWAY_PASSWORD";
+    default "";
+}
+# Raw token for the location = / rewrite (?token=PASS) so the OpenClaw SPA
+# never falls back to its native "paste your token" prompt when localStorage
+# is empty but our cookie is valid. See OPENCLAW_AUTH_AND_PROXY.md invariant 2.
+map \$cookie_oc_session \$oc_token {
+    "$COOKIE_VALUE" "$GATEWAY_PASSWORD";
+    default "";
+}
+%{ endif ~}
+GWAUTHCONF
+
+# Nginx config principal — el server block apunta al upstream ${upstream_name}
+# definido en /etc/nginx/conf.d/openclaw-upstream.conf. Cargamos TODOS los
+# archivos de conf.d/*.conf con wildcard para que add_custom_domain.sh pueda
+# inyectar nuevos server blocks (custom-domain-*.conf) sin tocar nginx.conf.
+# El main server block es el default_server :80 — captura el internal
+# subdomain (${instance_id}.orquestio.com) y, mientras un BYO domain todavía
+# no tiene su 443 block, también captura el HTTP-01 challenge de certbot.
+cat > /etc/nginx/nginx.conf << NGINXCONF
+events { worker_connections 1024; }
+http {
+    # Cloudflare terminates TLS and proxies HTTP to the origin. Without
+    # this flag, `return 302 /login` emits an absolute Location built from
+    # the origin's $scheme (http) — the browser drops out of HTTPS and the
+    # Secure cookie fails. Relative redirects sidestep the whole mess.
+    absolute_redirect off;
+    map_hash_bucket_size 128;
+
+    include /etc/nginx/conf.d/*.conf;
+
+    server {
+        listen 80 default_server;
+        server_name ${instance_id}.orquestio.com;
+
+        # Let's Encrypt HTTP-01 challenges for any BYO domain on this host.
+        # Served unauthenticated. Webroot dir is shared with the certbot
+        # cron renewal job in /etc/cron.d/certbot-renew.
+        location ^~ /.well-known/acme-challenge/ {
+            default_type "text/plain";
+            root /var/www/html;
+        }
+
+        location = /login {
+            alias /etc/nginx/html/login.html;
+            default_type text/html;
+        }
+
+        # Logout: expira la cookie oc_session en el browser y redirige a
+        # /login. Serverless — ningún estado server-side que invalidar (el
+        # password vive; esto es solo "borrar la cookie de este device").
+        # Para invalidar TODAS las sesiones usar rotate_password desde el
+        # portal (genera password nuevo → todas las cookies existentes
+        # dejan de matchear el map de conf.d/gateway-auth.conf).
+        location = /orquestio-logout {
+            add_header Set-Cookie "oc_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
+            return 302 /login;
+        }
+
+%{ if product_key == "openclaw" ~}
+        location = /healthz {
+            if (\$auth_ok = "no") {
+                return 401 '{"error":"unauthorized"}';
+            }
+            proxy_pass http://${upstream_name}/healthz;
+            proxy_set_header Authorization \$gateway_token_header;
+        }
+
+        # location = / handles the SPA root. We rewrite /  →  /?token=PASS so
+        # the OpenClaw SPA picks up the token from query string and never
+        # shows its native "paste your token" prompt. CRITICAL: WebSocket
+        # upgrades come in on / too — we MUST skip the rewrite when
+        # Upgrade: websocket is set, otherwise we return 302 instead of 101
+        # and the browser surfaces a 1006 disconnect.
+        # See orchestrator/docs/OPENCLAW_AUTH_AND_PROXY.md invariant 3.
+        location = / {
+            if (\$auth_ok = "no") {
+                return 302 /login;
+            }
+            set \$do_redirect "yes";
+            if (\$http_upgrade = "websocket") {
+                set \$do_redirect "no";
+            }
+            if (\$arg_token != "") {
+                set \$do_redirect "no";
+            }
+            if (\$do_redirect = "yes") {
+                rewrite ^ "/?token=\$oc_token" redirect;
+            }
+            proxy_pass http://${upstream_name}/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header X-Forwarded-User "client";
+            proxy_set_header Authorization \$gateway_token_header;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+
+        location / {
+            if (\$auth_ok = "no") {
+                return 302 /login;
+            }
+            proxy_pass http://${upstream_name};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header X-Forwarded-User "client";
+            proxy_set_header Authorization \$gateway_token_header;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+%{ endif ~}
+%{ if product_key == "hermes" ~}
+        # Brokered handoff entry (HYBRID shared auth). Cookieless by design,
+        # deliberately OUTSIDE the \$auth_ok guard. Proxies to the orchestrator
+        # edge which validates the single-use code and returns Set-Cookie.
+        location = /auth/handoff {
+            access_log off;
+            resolver 169.254.169.253 valid=30s;
+            set \$edge_host "api.orquestio.com";
+            proxy_pass https://\$edge_host/auth/edge/handoff\$is_args\$args;
+            proxy_ssl_server_name on;
+            proxy_ssl_name api.orquestio.com;
+            proxy_ssl_verify on;
+            proxy_ssl_verify_depth 2;
+            proxy_ssl_trusted_certificate /etc/pki/tls/certs/ca-bundle.crt;
+            proxy_set_header Host api.orquestio.com;
+            proxy_set_header X-Forwarded-Host \$host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_method GET;
+            proxy_pass_request_body off;
+            proxy_set_header Content-Length "";
+            proxy_set_header Authorization "";
+            proxy_set_header Cookie "";
+        }
+
+        # Hermes dashboard has no native auth (bound to loopback behind this
+        # wall). Once the cookie is valid we proxy straight through — no token
+        # rewrite, no Authorization injection — and STRIP the inbound Cookie so
+        # the session seed never reaches the product.
+        location = / {
+            if (\$auth_ok = "no") {
+                return 302 /login;
+            }
+            proxy_pass http://${upstream_name}/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+            # Hermes' dashboard dev-server rejects an unexpected Host header
+            # (400). It is on loopback behind this wall, so proxy the upstream's
+            # own host — the browser still sees the real hostname in its URL bar.
+            proxy_set_header Host 127.0.0.1:${container_port};
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header Cookie "";
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+
+        location / {
+            if (\$auth_ok = "no") {
+                return 302 /login;
+            }
+            proxy_pass http://${upstream_name};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+            # Hermes' dashboard dev-server rejects an unexpected Host header
+            # (400). It is on loopback behind this wall, so proxy the upstream's
+            # own host — the browser still sees the real hostname in its URL bar.
+            proxy_set_header Host 127.0.0.1:${container_port};
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header Cookie "";
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+%{ endif ~}
+    }
+}
+NGINXCONF
+
+systemctl enable nginx
+systemctl start nginx
+
+# Guard: verify nginx is actually running. Intermittent failures observed
+# (ai-test-006, 2026-04-17) where systemctl start returned 0 but the
+# service died immediately after. Retry up to 3 times with a short delay.
+for attempt in 1 2 3; do
+  sleep 2
+  if systemctl is-active --quiet nginx; then
+    echo "[$(date)] nginx confirmed active (attempt $attempt)"
+    break
+  fi
+  echo "[$(date)] WARNING: nginx not active after start, retry $attempt/3..."
+  systemctl start nginx
+done
+if ! systemctl is-active --quiet nginx; then
+  echo "[$(date)] CRITICAL: nginx failed to start after 3 retries"
+  systemctl status nginx --no-pager || true
+fi
+
+# --- 8. Cleanup of legacy watchdog timer (eliminado 2026-05-08) ---
+# Versiones previas de este user_data instalaban un systemd timer
+# (${watchdog_name}.timer) que cada 60s revisaba `docker inspect --format
+# '{{.State.Health.Status}}'` y si detectaba "unhealthy" 3 veces seguidas
+# llamaba a pre_start_wipe.sh + restart.sh para recrear el contenedor. Se
+# eliminó por dos razones, ambas observadas en la instancia bakvl1
+# (i-0f23f52e357a05981) durante 2026-05-08:
+#
+#   1. El cache-loop bug que justificaba el watchdog (upstream issue #73647)
+#      sólo era catastrófico cuando los datos vivían en EFS — la latencia
+#      NFS amplificaba 5-20× el costo de cada syscall del cache validator y
+#      llevaba al container a 100% I/O wait. Migrado a EBS gp3, el bucle se
+#      vuelve invisible (es lo que pasa en el laptop de un dev upstream).
+#
+#   2. El watchdog tenía un bug operativo: estaba recreando containers que
+#      se reportaban como `healthy` con streak=0, sin actualizar su state
+#      file ni dejar entries en bootstrap.log. La consecuencia neta era una
+#      recreación silenciosa cada ~13 min de un container que estaba bien;
+#      cada recreación interrumpía el chat y disparaba el reset de la sesión
+#      activa por parte de OpenClaw (.jsonl renombrado a .jsonl.reset.<ts>).
+#
+# Si en el futuro un container realmente muere (proceso node sale con error),
+# `--restart unless-stopped` del docker run en STEP 5 lo reinicia y preserva
+# el container ID. Para detectar containers atascados que no mueren pero
+# tampoco responden, se prefiere una alarma CloudWatch + alerta humana sobre
+# `--health-status` por más de 5 min, en lugar de auto-recrear sin signal.
+#
+# Si una instancia ya tiene el watchdog instalado de un user_data viejo, lo
+# desactivamos defensivamente acá. Es idempotente — fallos se ignoran.
+systemctl disable --now ${watchdog_name}.timer 2>/dev/null || true
+systemctl disable --now ${watchdog_name}.service 2>/dev/null || true
+rm -f /etc/systemd/system/${watchdog_name}.timer
+rm -f /etc/systemd/system/${watchdog_name}.service
+rm -f /usr/local/bin/${watchdog_name}.sh
+rm -f ${state_dir}/watchdog.state ${state_dir}/.watchdog_state
+systemctl daemon-reload 2>/dev/null || true
+
+echo "[$(date)] Bootstrap complete. Instance ready."
+echo "[$(date)] Access: https://${instance_id}.orquestio.com"
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"

@@ -1,0 +1,25 @@
+{
+  "key": "hermes",
+  "template_vars": {
+    "product_key": "hermes",
+    "health_port": "8642",
+    "container_name": "hermes-current",
+    "ctr_home": "/opt/data",
+    "plugin_host": "/var/lib/hermes/plugins",
+    "plugin_ctr": "/opt/data/.plugins",
+    "health_path": "/health",
+    "run_cmd": "gateway run",
+    "state_dir": "/var/lib/hermes",
+    "scripts_dir": "/opt/hermes/scripts",
+    "product_home": "/opt/hermes",
+    "ssm_bundle_params": "HERMES_SCRIPTS_B64 HERMES_SEC_SCRIPTS_B64 HERMES_BYO_SCRIPTS_B64",
+    "config_file": ".env",
+    "seed_version": "2026.7.7",
+    "env_gateway_password": "API_SERVER_KEY",
+    "env_gateway_token": "HERMES_API_KEY",
+    "watchdog_name": "hermes-watchdog",
+    "product_label": "Hermes",
+    "upstream_conf": "hermes-upstream.conf",
+    "upstream_name": "hermes_backend"
+  }
+}
