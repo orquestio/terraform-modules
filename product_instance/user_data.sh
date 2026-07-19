@@ -217,8 +217,10 @@ chown 1000:1000 "$CONTAINER_ENV_FILE"
 # is harmless on the box. The dir lives OUTSIDE EFS specifically so it's
 # wiped on instance replacement. See OPENCLAW_AUTH_AND_PROXY.md and the
 # pre_start_wipe.sh / ${watchdog_name}.service installed below.
+%{ if product_key == "openclaw" ~}
 mkdir -p ${plugin_host}
 chown -R 1000:1000 ${state_dir}
+%{ endif ~}
 
 echo "[$(date)] Starting ${product_label} container"
 # Healthcheck strategy: we OVERRIDE the image's baked-in healthcheck with our
@@ -232,6 +234,7 @@ echo "[$(date)] Starting ${product_label} container"
 # in this comment to document the choice and to satisfy the test invariant in
 # tests/unit/test_openclaw_scripts_invariants.py that the alternative was
 # considered.)
+%{ if product_key == "openclaw" ~}
 docker run -d \
   --name ${container_name} \
   --restart unless-stopped \
@@ -250,6 +253,32 @@ docker run -d \
   -p 127.0.0.1:${container_port}:${container_port} \
   "${docker_image}" \
   ${run_cmd} ${container_port}
+%{ endif ~}
+%{ if product_key == "hermes" ~}
+# Hermes uses HOST networking. Ground truth: on a bridge network the dashboard
+# binding to 127.0.0.1 is unreachable from the host nginx wall, and binding to
+# 0.0.0.0 fails closed (upstream #49567). Host networking lets the wall reach the
+# loopback dashboard (127.0.0.1:${container_port}) and the health API
+# (0.0.0.0:${health_port}); external exposure is still blocked by the instance
+# security group (80/443 only). SECURITY FOLLOW-UP (flag for review): host
+# networking gives the container access to IMDS (169.254.169.254) and the
+# instance IAM role — harden with an nginx-sidecar or IMDS egress block before
+# GA, and keep the instance role least-privilege.
+docker run -d \
+  --name ${container_name} \
+  --restart unless-stopped \
+  --network host \
+  --env-file "$CONTAINER_ENV_FILE" \
+  -e TZ=UTC \
+  -v "$EFS_MOUNT/config:${ctr_home}" \
+  --health-cmd "curl -sf --max-time 3 http://127.0.0.1:${health_port}${health_path} || exit 1" \
+  --health-interval 30s \
+  --health-timeout 5s \
+  --health-retries 3 \
+  --health-start-period 1200s \
+  "${docker_image}" \
+  ${run_cmd}
+%{ endif ~}
 # NOTE: entry point changed from `dist/index.js` to `openclaw.mjs` in upstream
 # v2026.4.9 (Docker CMD refactor). Older images (≤v2026.4.8) still use
 # `dist/index.js`. Keep this command in sync with the docker_image version
@@ -365,6 +394,7 @@ map \$cookie_oc_session \$auth_ok {
     "$COOKIE_VALUE" "yes";
     default "no";
 }
+%{ if product_key == "openclaw" ~}
 # When cookie is valid, inject the raw token so OpenClaw doesn't show its
 # own login page. The user authenticates ONCE via our cookie wall.
 map \$cookie_oc_session \$gateway_token_header {
@@ -378,6 +408,7 @@ map \$cookie_oc_session \$oc_token {
     "$COOKIE_VALUE" "$GATEWAY_PASSWORD";
     default "";
 }
+%{ endif ~}
 GWAUTHCONF
 
 # Nginx config principal — el server block apunta al upstream ${upstream_name}
@@ -427,6 +458,7 @@ http {
             return 302 /login;
         }
 
+%{ if product_key == "openclaw" ~}
         location = /healthz {
             if (\$auth_ok = "no") {
                 return 401 '{"error":"unauthorized"}';
@@ -487,6 +519,69 @@ http {
             proxy_read_timeout 86400s;
             proxy_send_timeout 86400s;
         }
+%{ endif ~}
+%{ if product_key == "hermes" ~}
+        # Brokered handoff entry (HYBRID shared auth). Cookieless by design,
+        # deliberately OUTSIDE the \$auth_ok guard. Proxies to the orchestrator
+        # edge which validates the single-use code and returns Set-Cookie.
+        location = /auth/handoff {
+            access_log off;
+            resolver 169.254.169.253 valid=30s;
+            set \$edge_host "api.orquestio.com";
+            proxy_pass https://\$edge_host/auth/edge/handoff\$is_args\$args;
+            proxy_ssl_server_name on;
+            proxy_ssl_name api.orquestio.com;
+            proxy_ssl_verify on;
+            proxy_ssl_verify_depth 2;
+            proxy_ssl_trusted_certificate /etc/pki/tls/certs/ca-bundle.crt;
+            proxy_set_header Host api.orquestio.com;
+            proxy_set_header X-Forwarded-Host \$host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_method GET;
+            proxy_pass_request_body off;
+            proxy_set_header Content-Length "";
+            proxy_set_header Authorization "";
+            proxy_set_header Cookie "";
+        }
+
+        # Hermes dashboard has no native auth (bound to loopback behind this
+        # wall). Once the cookie is valid we proxy straight through — no token
+        # rewrite, no Authorization injection — and STRIP the inbound Cookie so
+        # the session seed never reaches the product.
+        location = / {
+            if (\$auth_ok = "no") {
+                return 302 /login;
+            }
+            proxy_pass http://${upstream_name}/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header Cookie "";
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+
+        location / {
+            if (\$auth_ok = "no") {
+                return 302 /login;
+            }
+            proxy_pass http://${upstream_name};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header Cookie "";
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+%{ endif ~}
     }
 }
 NGINXCONF
