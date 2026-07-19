@@ -202,7 +202,9 @@ server {
         }
         proxy_pass http://hermes_backend;
         proxy_http_version 1.1;
-        proxy_set_header Host              \$host;
+        # Hermes dashboard dev-server rejects an unexpected Host (400); it is on
+        # loopback behind this wall, so proxy the upstream's own host.
+        proxy_set_header Host              127.0.0.1:9119;
         proxy_set_header X-Real-IP         \$remote_addr;
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;

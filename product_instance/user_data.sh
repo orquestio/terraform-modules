@@ -566,7 +566,10 @@ http {
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection "upgrade";
-            proxy_set_header Host \$host;
+            # Hermes' dashboard dev-server rejects an unexpected Host header
+            # (400). It is on loopback behind this wall, so proxy the upstream's
+            # own host — the browser still sees the real hostname in its URL bar.
+            proxy_set_header Host 127.0.0.1:${container_port};
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto \$scheme;
@@ -583,7 +586,10 @@ http {
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection "upgrade";
-            proxy_set_header Host \$host;
+            # Hermes' dashboard dev-server rejects an unexpected Host header
+            # (400). It is on loopback behind this wall, so proxy the upstream's
+            # own host — the browser still sees the real hostname in its URL bar.
+            proxy_set_header Host 127.0.0.1:${container_port};
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto \$scheme;
