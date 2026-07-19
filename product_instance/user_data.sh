@@ -127,6 +127,9 @@ if [ ! -f "$EFS_MOUNT/config/${config_file}" ]; then
       "workspace": "${ctr_home}/workspace"
     }
   },
+  "update": {
+    "checkOnStart": false
+  },
   "session": {
     "dmScope": "per-channel-peer"
   },
